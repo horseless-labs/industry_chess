@@ -10,3 +10,9 @@ Cannot move to target thread (0x456eee0)
 Camera read failed.
 [ WARN:0@161.098] global cap_v4l.cpp:803 requestBuffers VIDEOIO(V4L2:/dev/video4): failed VIDIOC_REQBUFS: errno=19 (No such device)
 ```
+
+
+## 1248
+Problems:
+- `detect_board.py` consistently chooses a region of the video feed that is too small, merely a portion of the board.
+- Once that region is locked in, it seems that no updates are possible.
