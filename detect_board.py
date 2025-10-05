@@ -8,6 +8,7 @@ import os
 import sys
 import glob
 import platform
+import time
 
 # ---------- Config ----------
 CANONICAL_SIZE = 512               # rectified board size (pixels)
@@ -61,11 +62,12 @@ def orientation_fix(rectified):
         return cv.rotate(rectified, cv.ROTATE_180)
     return rectified
 
-# ---------- Detection: Grid-first ----------
+# ---------- Detection: Grid-first (CLAHE) ----------
 def detect_grid_homography(frame):
     """Try to detect the 7x7 inner-corner grid to compute a robust H."""
     gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-    gray = cv.equalizeHist(gray)
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
     flags = cv.CALIB_CB_EXHAUSTIVE + cv.CALIB_CB_ACCURACY
     ret, corners = cv.findChessboardCornersSB(gray, BOARD_INNER, flags=flags)
     if not ret:
@@ -167,14 +169,95 @@ def detect_outer_corners_hough(frame):
     conf = 0.5*area_norm + 0.5*max(0.0, ortho)
     return quad, conf
 
+# ---------- Tracking (KLT) ----------
+class BoardTracker:
+    def __init__(self):
+        self.img_pts = None    # last-tracked 2D points (Nx2)
+        self.canon_pts = None  # matching canonical 2D points (Nx2)
+        self.prev_gray = None
+        self.failed_frames = 0
+
+    def seed_from_H(self, H, size=CANONICAL_SIZE, inner=BOARD_INNER):
+        xs = np.linspace((0.5/8)*size, (7.5/8)*size, inner[0], dtype=np.float32)
+        ys = np.linspace((0.5/8)*size, (7.5/8)*size, inner[1], dtype=np.float32)
+        XX, YY = np.meshgrid(xs, ys)
+        canon = np.stack([XX.ravel(), YY.ravel()], axis=1)
+
+        Hinv = np.linalg.inv(H)
+        pts3 = np.concatenate([canon, np.ones((canon.shape[0],1), np.float32)], axis=1)
+        proj = (Hinv @ pts3.T).T
+        proj = (proj[:, :2] / proj[:, 2:3]).astype(np.float32)
+
+        self.img_pts = proj
+        self.canon_pts = canon.astype(np.float32)
+        self.prev_gray = None
+        self.failed_frames = 0
+
+    def track_and_refit(self, frame_bgr):
+        if self.img_pts is None or self.canon_pts is None:
+            return None, 0.0
+
+        gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return None, 0.0
+
+        next_pts, st, err = cv.calcOpticalFlowPyrLK(
+            self.prev_gray, gray,
+            self.img_pts.reshape(-1,1,2),
+            None, winSize=(21,21), maxLevel=3,
+            criteria=(cv.TERM_CRITERIA_EPS|cv.TERM_CRITERIA_COUNT, 30, 0.01)
+        )
+        if next_pts is None or st is None:
+            self.failed_frames += 1
+            self.prev_gray = gray
+            return None, 0.0
+
+        st = st.reshape(-1).astype(bool)
+        tracked_img = next_pts.reshape(-1,2)[st]
+        tracked_can = self.canon_pts[st]
+
+        if len(tracked_img) < 12:
+            self.failed_frames += 1
+            self.prev_gray = gray
+            return None, 0.0
+
+        H, mask = cv.findHomography(tracked_img, tracked_can, cv.RANSAC, 3.0)
+        if H is None or mask is None:
+            self.failed_frames += 1
+            self.prev_gray = gray
+            return None, 0.0
+
+        inlier_mask = mask.reshape(-1).astype(bool)
+        inlier_ratio = float(inlier_mask.sum()) / len(inlier_mask)
+
+        # Update stored points for next round
+        self.img_pts = tracked_img[inlier_mask]
+        self.canon_pts = tracked_can[inlier_mask]
+        self.prev_gray = gray
+        self.failed_frames = 0
+        return H, inlier_ratio
+
+def crop_to_quad(frame, quad, pad=20):
+    if quad is None:
+        return frame, (0,0)
+    x0 = max(int(min(quad[:,0]))-pad, 0)
+    y0 = max(int(min(quad[:,1]))-pad, 0)
+    x1 = min(int(max(quad[:,0]))+pad, frame.shape[1])
+    y1 = min(int(max(quad[:,1]))+pad, frame.shape[0])
+    roi = frame[y0:y1, x0:x1]
+    return roi, (x0, y0)
+
 # ---------- Main rectification step ----------
 class HomographyKeeper:
     def __init__(self):
         self.H = None
         self.conf_hist = deque(maxlen=CONF_HISTORY)
+        self.tracker = BoardTracker()
 
     def update(self, H, conf):
-        if H is None: return False
+        if H is None:
+            return False
         self.conf_hist.append(conf)
         avg = sum(self.conf_hist)/len(self.conf_hist)
         if conf >= UPDATE_MIN_CONF or (self.H is None and conf > 0):
@@ -183,70 +266,114 @@ class HomographyKeeper:
         return False
 
 def rectify_frame(frame, keeper):
-    H, inlier_ratio = detect_grid_homography(frame)
-    conf_grid = float(inlier_ratio)
+    # 0) predictive tracking if we already have an H
+    H = None
+    conf_track = 0.0
+    quad_est = None
 
-    quad, conf_hough = (None, 0.0)
-    if H is None or conf_grid < 0.5:
-        res = detect_outer_corners_hough(frame)
+    if keeper.H is not None:
+        Ht, r = keeper.tracker.track_and_refit(frame)
+        if Ht is not None and r >= 0.4:
+            H = Ht
+            conf_track = r
+
+        # estimate quad for ROI
+        canon_corners = np.float32([[0,0],[CANONICAL_SIZE-1,0],[CANONICAL_SIZE-1,CANONICAL_SIZE-1],[0,CANONICAL_SIZE-1]])
+        Hinv = np.linalg.inv(keeper.H)
+        pts3 = np.concatenate([canon_corners, np.ones((4,1), np.float32)], axis=1)
+        proj = (Hinv @ pts3.T).T
+        proj = (proj[:, :2] / proj[:, 2:3]).astype(np.float32)
+        quad_est = order_quad(proj)
+
+    # 1) detectors (possibly in ROI)
+    search_frame = frame
+    offset = (0, 0)
+    if quad_est is not None:
+        search_frame, offset = crop_to_quad(frame, quad_est, pad=40)
+
+    conf_grid = 0.0
+    conf_hough = 0.0
+    quad = None
+
+    if H is None:
+        Hg, inlier_ratio = detect_grid_homography(search_frame)
+        if Hg is not None:
+            # bake translation (search_frame is cropped)
+            T = np.array([[1,0,-offset[0]],
+                          [0,1,-offset[1]],
+                          [0,0,1]], dtype=np.float32)
+            H = Hg @ T
+            conf_grid = float(inlier_ratio)
+
+    if (H is None) or (conf_grid < 0.5 and conf_track < 0.5):
+        res = detect_outer_corners_hough(search_frame)
         if res[0] is not None:
-            quad, conf_hough = res
+            quad = res[0] + np.array(offset, dtype=np.float32)  # un-crop
             H = homography_from_pts4(quad)
+            conf_hough = res[1]
+        else:
+            quad = None
+    else:
+        quad = quad_est
 
-    conf = max(conf_grid, conf_hough)
+    # 2) choose confidence, update keeper
+    conf = max(conf_track, conf_grid, conf_hough)
     keeper.update(H, conf)
 
     if keeper.H is None:
         return None, conf, (conf_grid, conf_hough), None
 
+    # 3) refresh tracker when we have a good H
+    if conf >= 0.55 and (keeper.tracker.canon_pts is None or len(keeper.tracker.canon_pts) < 20 or keeper.tracker.failed_frames > 0):
+        keeper.tracker.seed_from_H(keeper.H)
+
     rectified = cv.warpPerspective(frame, keeper.H, (CANONICAL_SIZE, CANONICAL_SIZE))
     rectified = orientation_fix(rectified)
     return rectified, conf, (conf_grid, conf_hough), quad
 
-# ---------- NEW: Camera selection helpers ----------
-def _probe_source(open_arg, api_pref=None):
-    """Try to open a source (index or path). Returns (cap, (w,h)) or (None, None)."""
-    cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
-    if not cap.isOpened():
-        cap.release()
-        return None, None
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        return None, None
-    h, w = frame.shape[:2]
-    return cap, (w, h)
-
+# ---------- Safer camera enumeration & opening ----------
 def list_cameras():
-    """Enumerate likely camera sources and return a list of available devices."""
+    """List likely camera nodes without stress-testing them."""
     cams = []
     key_counter = 0
 
-    # On Linux, prefer explicit device paths for stability
     if platform.system() == 'Linux':
         for path in sorted(glob.glob('/dev/video*')):
-            cap, res = _probe_source(path, api_pref=cv.CAP_V4L2)
-            if cap is not None:
-                cap.release()
-                key = str(key_counter)
-                key_counter += 1
-                label = f"{path} (V4L2, {res[0]}x{res[1]})"
-                cams.append({'key': key, 'label': label, 'open_arg': path, 'api': cv.CAP_V4L2})
+            key = str(key_counter); key_counter += 1
+            label = f"{path} (V4L2)"
+            cams.append({'key': key, 'label': label, 'open_arg': path, 'api': cv.CAP_V4L2})
 
-    # Fallback for other OSes or if V4L2 fails: numeric indices
-    for idx in range(SCAN_MAX_INDEX):
-        cap, res = _probe_source(idx)
-        if cap is not None:
-            cap.release()
-            key = str(key_counter)
-            key_counter += 1
-            label = f"Device Index {idx} ({res[0]}x{res[1]})"
-            cams.append({'key': key, 'label': label, 'open_arg': idx, 'api': None})
+    # Numeric indices as a fallback
+    for idx in range(min(SCAN_MAX_INDEX, 6)):
+        key = str(key_counter); key_counter += 1
+        label = f"Device Index {idx}"
+        cams.append({'key': key, 'label': label, 'open_arg': idx, 'api': None})
 
     return cams
 
+def _open_camera(open_arg, api_pref):
+    cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
+    if not cap.isOpened():
+        return None
+    # stabilize the stream
+    cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv.CAP_PROP_FPS, 30)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+    # prefer MJPG if available
+    try:
+        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+    except Exception:
+        pass
+    # prime a frame
+    ok, _ = cap.read()
+    if not ok:
+        cap.release()
+        return None
+    return cap
+
 def select_camera_interactive():
-    """Print a menu, let the user select a camera, and return the opened device."""
+    """Print a menu, let the user select a camera, and return the opened device + args."""
     while True:
         cams = list_cameras()
         print("\n=== Select a Camera ===")
@@ -260,7 +387,7 @@ def select_camera_interactive():
         choice = input("Enter selection: ").strip().lower()
 
         if choice == 'q':
-            return None, None
+            return None, None, None
         if choice == 'r':
             continue
 
@@ -269,18 +396,15 @@ def select_camera_interactive():
             print("Invalid selection.")
             continue
 
-        api = match['api']
-        open_arg = match['open_arg']
-        cap = cv.VideoCapture(open_arg, api) if api else cv.VideoCapture(open_arg)
-        
-        if not cap.isOpened():
+        cap = _open_camera(match['open_arg'], match['api'])
+        if cap is None:
             print("Error: Failed to open the selected camera.")
             continue
-        
-        print(f"Successfully opened camera: {match['label']}")
-        return cap, match['label']
 
-# ---------- MODIFIED: Demo / glue ----------
+        print(f"Successfully opened camera: {match['label']}")
+        return cap, match['label'], (match['open_arg'], match['api'])
+
+# ---------- Demo / glue ----------
 def draw_debug(frame, rectified, confs, quad):
     vis = frame.copy()
     conf_grid, conf_hough = confs
@@ -296,16 +420,43 @@ def draw_debug(frame, rectified, confs, quad):
             cv.line(rectified, (i*tile, 0), (i*tile, CANONICAL_SIZE), (128,128,128), 1)
     return vis, rectified
 
-def run_loop(cap, cam_label):
-    """Main video processing loop."""
+def run_loop(cap, cam_label, open_arg_and_api):
+    """Main video processing loop with auto-reconnect."""
     keeper = HomographyKeeper()
     win_name = "Board Rectification"
+    cv.namedWindow(win_name, cv.WINDOW_NORMAL)
+
+    consecutive_fail = 0
+    reopen_delay = 0.5
 
     while True:
         ok, frame = cap.read()
-        if not ok:
+        if not ok or frame is None:
+            consecutive_fail += 1
             print("Camera read failed.")
-            break
+            if consecutive_fail >= 3 and open_arg_and_api is not None:
+                print("Attempting to reopen camera...")
+                cap.release()
+                time.sleep(reopen_delay)
+                open_arg, api = open_arg_and_api
+                cap = _open_camera(open_arg, api)
+                if cap is None:
+                    print("Reopen failed; will retry.")
+                    time.sleep(0.5)
+                    if (cv.waitKey(1) & 0xFF) in (27, ord('q')):
+                        break
+                    continue
+                print("Reconnected.")
+                consecutive_fail = 0
+                reopen_delay = min(reopen_delay * 1.5, 2.0)
+                continue
+
+            time.sleep(0.05)
+            if (cv.waitKey(1) & 0xFF) in (27, ord('q')):
+                break
+            continue
+
+        consecutive_fail = 0
 
         rectified, conf, confs, quad = rectify_frame(frame, keeper)
         if SHOW:
@@ -327,15 +478,11 @@ def run_loop(cap, cam_label):
             break
 
 def main():
-    """Main function to handle camera selection and processing loop."""
-    cap, label = select_camera_interactive()
-
+    cap, label, open_pack = select_camera_interactive()
     if cap is None:
         print("No camera selected. Exiting.")
         return
-
-    run_loop(cap, label)
-
+    run_loop(cap, label, open_pack)
     cap.release()
     cv.destroyAllWindows()
 
