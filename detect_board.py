@@ -1,0 +1,265 @@
+# chessboard_rectify_noprinter.py
+# Requires: pip install opencv-python numpy
+
+import cv2 as cv
+import numpy as np
+from collections import deque
+
+# ---------- Config ----------
+CANONICAL_SIZE = 512               # rectified board size (pixels)
+BOARD_INNER = (7, 7)               # 7x7 inner corners for an 8x8 chessboard
+EDGE_TH = (60, 180)                # Canny thresholds for Hough fallback
+MIN_LINE_LEN = 120                 # HoughP min line length
+MAX_LINE_GAP = 10                  # HoughP max gap
+CONF_HISTORY = 10                  # rolling quality history
+UPDATE_MIN_CONF = 0.35             # don't update H if confidence lower than this
+SHOW = True
+
+# ---------- Utilities ----------
+def order_quad(pts):
+    """Order 4 points as [tl, tr, br, bl]."""
+    pts = np.array(pts, dtype=np.float32)
+    c = pts.mean(axis=0)
+    angles = np.arctan2(pts[:,1]-c[1], pts[:,0]-c[0])
+    idx = np.argsort(angles)
+    pts = pts[idx]
+    # Now enforce tl as smallest x+y
+    s = pts.sum(axis=1)
+    tl = np.argmin(s)
+    pts = np.roll(pts, -tl, axis=0)
+    return pts
+
+def homography_from_pts4(pts4, size=CANONICAL_SIZE):
+    dst = np.float32([[0,0],[size-1,0],[size-1,size-1],[0,size-1]])
+    return cv.getPerspectiveTransform(pts4, dst)
+
+def square_bbox(file_idx, rank_idx, size=CANONICAL_SIZE):
+    tile = size // 8
+    x0 = file_idx * tile
+    y0 = (7 - rank_idx) * tile  # rank 1 at bottom
+    return x0, y0, tile, tile
+
+def average_luma(img):
+    if len(img.shape)==3:
+        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    return float(img.mean())
+
+def orientation_fix(rectified):
+    """Rotate 180° if a1 isn't dark (relative to h1). Robust to lighting by comparing corners."""
+    tile = CANONICAL_SIZE // 8
+    pad = max(2, tile//10)
+    # a1 crop (file 0, rank 0 = bottom-left)
+    a1 = rectified[(7*tile)+pad:(8*tile)-pad, 0+pad:tile-pad]
+    h1 = rectified[(7*tile)+pad:(8*tile)-pad, (7*tile)+pad:(8*tile)-pad]
+    if average_luma(a1) > average_luma(h1):  # a1 should be darker than h1
+        return cv.rotate(rectified, cv.ROTATE_180)
+    return rectified
+
+# ---------- Detection: Grid-first ----------
+def detect_grid_homography(frame):
+    """Try to detect the 7x7 inner-corner grid to compute a robust H."""
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    # Light contrast normalization helps glossy boards
+    gray = cv.equalizeHist(gray)
+    flags = cv.CALIB_CB_EXHAUSTIVE + cv.CALIB_CB_ACCURACY
+    ret, corners = cv.findChessboardCornersSB(gray, BOARD_INNER, flags=flags)
+    if not ret:
+        return None, 0.0
+
+    # findChessboardCornersSB returns row-major corners (N x 1 x 2)
+    img_pts = corners.reshape(-1, 2).astype(np.float32)
+
+    # Build canonical 2D grid inside the rectified board
+    xs = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[0])
+    ys = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[1])
+    XX, YY = np.meshgrid(xs, ys)
+    canon_pts = np.stack([XX.ravel(), YY.ravel()], axis=1).astype(np.float32)
+
+    H, mask = cv.findHomography(img_pts, canon_pts, cv.RANSAC, 3.0)
+    if H is None:
+        return None, 0.0
+    inlier_ratio = float(mask.sum()) / len(mask)
+    return H, inlier_ratio
+
+# ---------- Detection: 4-corner fallback via Hough ----------
+def detect_outer_corners_hough(frame):
+    """Detect outer 4 board corners from dominant orthogonal lines."""
+    work = cv.GaussianBlur(frame, (5,5), 0)
+    gray = cv.cvtColor(work, cv.COLOR_BGR2GRAY)
+    edges = cv.Canny(gray, EDGE_TH[0], EDGE_TH[1])
+
+    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=120,
+                           minLineLength=MIN_LINE_LEN, maxLineGap=MAX_LINE_GAP)
+    if lines is None:
+        return None, 0.0
+
+    # Separate nearly-horizontal vs nearly-vertical
+    horiz, vert = [], []
+    for l in lines[:,0,:]:
+        x1,y1,x2,y2 = l
+        dx, dy = x2-x1, y2-y1
+        angle = np.degrees(np.arctan2(dy, dx))
+        if abs(angle) < 20 or abs(angle) > 160:
+            horiz.append(l)
+        elif 70 < abs(angle) < 110:
+            vert.append(l)
+
+    if len(horiz) < 2 or len(vert) < 2:
+        return None, 0.0
+
+    # Pick the extreme two for each family by y (horiz) and x (vert)
+    horiz = np.array(horiz)
+    vert  = np.array(vert)
+
+    # For each line, compute midpoints and use them to rank extremes
+    def midpoints(lines):
+        m = (lines[:,0:2] + lines[:,2:4]) / 2.0
+        return m
+
+    hm = midpoints(horiz); vm = midpoints(vert)
+    top_idx = np.argmin(hm[:,1]); bottom_idx = np.argmax(hm[:,1])
+    left_idx = np.argmin(vm[:,0]); right_idx  = np.argmax(vm[:,0])
+
+    top_line = horiz[top_idx]
+    bot_line = horiz[bottom_idx]
+    left_line = vert[left_idx]
+    right_line = vert[right_idx]
+
+    def line_params(l):
+        x1,y1,x2,y2 = l
+        A = y2 - y1
+        B = x1 - x2
+        C = A*x1 + B*y1
+        return A, B, C
+
+    def intersect(l1, l2):
+        A1,B1,C1 = line_params(l1)
+        A2,B2,C2 = line_params(l2)
+        det = A1*B2 - A2*B1
+        if abs(det) < 1e-6: return None
+        x = (B2*C1 - B1*C2) / det
+        y = (A1*C2 - A2*C1) / det
+        return np.array([x,y], dtype=np.float32)
+
+    pts = [
+        intersect(top_line, left_line),
+        intersect(top_line, right_line),
+        intersect(bot_line, right_line),
+        intersect(bot_line, left_line),
+    ]
+    if any(p is None for p in pts):
+        return None, 0.0
+
+    quad = order_quad(pts)
+    # Basic sanity: convex and inside frame
+    h, w = frame.shape[:2]
+    if np.any(quad[:,0] < -5) or np.any(quad[:,0] > w+5) or np.any(quad[:,1] < -5) or np.any(quad[:,1] > h+5):
+        return None, 0.0
+
+    # Confidence heuristic: area and orthogonality
+    def poly_area(q):
+        return 0.5*abs(np.dot(q[:,0], np.roll(q[:,1], -1)) - np.dot(q[:,1], np.roll(q[:,0], -1)))
+    area = poly_area(quad)
+    area_norm = area / (w*h + 1e-6)
+
+    v1 = quad[1] - quad[0]
+    v2 = quad[3] - quad[0]
+    cosang = abs(np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2) + 1e-6))
+    ortho = 1 - cosang  # 1 is perfect orthogonal
+
+    conf = 0.5*area_norm + 0.5*max(0.0, ortho)
+    return quad, conf
+
+# ---------- Main rectification step ----------
+class HomographyKeeper:
+    def __init__(self):
+        self.H = None
+        self.conf_hist = deque(maxlen=CONF_HISTORY)
+
+    def update(self, H, conf):
+        if H is None: return False
+        self.conf_hist.append(conf)
+        avg = sum(self.conf_hist)/len(self.conf_hist)
+        if conf >= UPDATE_MIN_CONF or (self.H is None and conf > 0):
+            self.H = H
+            return True
+        return False
+
+def rectify_frame(frame, keeper):
+    # 1) Try grid-based homography (best when board is clear)
+    H, inlier_ratio = detect_grid_homography(frame)
+    conf_grid = float(inlier_ratio)
+
+    # 2) If grid fails or is weak, try 4-corner Hough
+    quad, conf_hough = (None, 0.0)
+    if H is None or conf_grid < 0.5:
+        res = detect_outer_corners_hough(frame)
+        if res[0] is not None:
+            quad, conf_hough = res
+            H = homography_from_pts4(quad)
+
+    # 3) Choose confidence and update
+    conf = max(conf_grid, conf_hough)
+    keeper.update(H, conf)
+
+    # 4) Warp using current best H (don’t stall if detection failed this frame)
+    if keeper.H is None:
+        return None, conf, (conf_grid, conf_hough), None
+
+    rectified = cv.warpPerspective(frame, keeper.H, (CANONICAL_SIZE, CANONICAL_SIZE))
+    rectified = orientation_fix(rectified)
+    return rectified, conf, (conf_grid, conf_hough), quad
+
+# ---------- Demo / glue ----------
+def draw_debug(frame, rectified, confs, quad):
+    vis = frame.copy()
+    conf_grid, conf_hough = confs
+    h, w = frame.shape[:2]
+    if quad is not None:
+        q = quad.astype(int)
+        cv.polylines(vis, [q], isClosed=True, color=(0,255,0), thickness=2)
+    cv.putText(vis, f"grid:{conf_grid:.2f}  hough:{conf_hough:.2f}", (10, 30),
+               cv.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv.LINE_AA)
+    if rectified is not None:
+        # Overlay a light 8x8 grid on the rectified image
+        tile = CANONICAL_SIZE // 8
+        for i in range(9):
+            cv.line(rectified, (0, i*tile), (CANONICAL_SIZE, i*tile), (128,128,128), 1)
+            cv.line(rectified, (i*tile, 0), (i*tile, CANONICAL_SIZE), (128,128,128), 1)
+    return vis, rectified
+
+def main():
+    # cap = cv.VideoCapture(0)  # change to your source
+    cap = cv.VideoCapture(1)
+    if not cap.isOpened():
+        print("Camera open failed.")
+        return
+    keeper = HomographyKeeper()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok: break
+
+        rectified, conf, confs, quad = rectify_frame(frame, keeper)
+        if SHOW:
+            vis, rect = draw_debug(frame, None if rectified is None else rectified.copy(), confs, quad)
+            if rect is not None:
+                side = CANONICAL_SIZE
+                # show side-by-side
+                h = max(vis.shape[0], side)
+                canvas = np.zeros((h, vis.shape[1]+side, 3), dtype=np.uint8)
+                canvas[:vis.shape[0], :vis.shape[1]] = vis
+                canvas[:side, vis.shape[1]:vis.shape[1]+side] = rect
+                cv.imshow("Board rectification", canvas)
+            else:
+                cv.imshow("Board rectification", vis)
+
+        key = cv.waitKey(1) & 0xFF
+        if key == 27 or key == ord('q'):
+            break
+
+    cap.release()
+    cv.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
