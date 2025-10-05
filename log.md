@@ -11,7 +11,6 @@ Camera read failed.
 [ WARN:0@161.098] global cap_v4l.cpp:803 requestBuffers VIDEOIO(V4L2:/dev/video4): failed VIDIOC_REQBUFS: errno=19 (No such device)
 ```
 
-
 ## 1248
 Problems:
 - `detect_board.py` consistently chooses a region of the video feed that is too small, merely a portion of the board.
@@ -19,3 +18,11 @@ Problems:
 
 ## 1352
 Added the ability to manually recalibrate for the board. Something about the auto detector is too spotty; must remember to investigate later.
+
+## 1508
+Added video capture. The code is set up to capture both the original and the rectified output. One might be better for identifying final board configurations than the other, but we'll see.
+
+Currently wondering if the code for detection of the board should just be removed, since manual calibration has been needed for every test so far. Next steps:
+- Attempt auto-calibration on other surfaces and lighting conditions.
+- Try different tape or bright corner markers on the board.
+- Adjust thresholds in the code itself.
