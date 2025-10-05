@@ -1,9 +1,13 @@
-# chessboard_rectify_noprinter.py
+# chessboard_rectify_noprinter_menu.py
 # Requires: pip install opencv-python numpy
 
 import cv2 as cv
 import numpy as np
 from collections import deque
+import os
+import sys
+import glob
+import platform
 
 # ---------- Config ----------
 CANONICAL_SIZE = 512               # rectified board size (pixels)
@@ -14,6 +18,9 @@ MAX_LINE_GAP = 10                  # HoughP max gap
 CONF_HISTORY = 10                  # rolling quality history
 UPDATE_MIN_CONF = 0.35             # don't update H if confidence lower than this
 SHOW = True
+
+# How far to scan numeric camera indices if OS-specific paths aren't found
+SCAN_MAX_INDEX = 10
 
 # ---------- Utilities ----------
 def order_quad(pts):
@@ -45,10 +52,9 @@ def average_luma(img):
     return float(img.mean())
 
 def orientation_fix(rectified):
-    """Rotate 180° if a1 isn't dark (relative to h1). Robust to lighting by comparing corners."""
+    """Rotate 180° if a1 isn't dark (relative to h1)."""
     tile = CANONICAL_SIZE // 8
     pad = max(2, tile//10)
-    # a1 crop (file 0, rank 0 = bottom-left)
     a1 = rectified[(7*tile)+pad:(8*tile)-pad, 0+pad:tile-pad]
     h1 = rectified[(7*tile)+pad:(8*tile)-pad, (7*tile)+pad:(8*tile)-pad]
     if average_luma(a1) > average_luma(h1):  # a1 should be darker than h1
@@ -59,17 +65,14 @@ def orientation_fix(rectified):
 def detect_grid_homography(frame):
     """Try to detect the 7x7 inner-corner grid to compute a robust H."""
     gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
-    # Light contrast normalization helps glossy boards
     gray = cv.equalizeHist(gray)
     flags = cv.CALIB_CB_EXHAUSTIVE + cv.CALIB_CB_ACCURACY
     ret, corners = cv.findChessboardCornersSB(gray, BOARD_INNER, flags=flags)
     if not ret:
         return None, 0.0
 
-    # findChessboardCornersSB returns row-major corners (N x 1 x 2)
     img_pts = corners.reshape(-1, 2).astype(np.float32)
 
-    # Build canonical 2D grid inside the rectified board
     xs = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[0])
     ys = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[1])
     XX, YY = np.meshgrid(xs, ys)
@@ -93,7 +96,6 @@ def detect_outer_corners_hough(frame):
     if lines is None:
         return None, 0.0
 
-    # Separate nearly-horizontal vs nearly-vertical
     horiz, vert = [], []
     for l in lines[:,0,:]:
         x1,y1,x2,y2 = l
@@ -107,14 +109,11 @@ def detect_outer_corners_hough(frame):
     if len(horiz) < 2 or len(vert) < 2:
         return None, 0.0
 
-    # Pick the extreme two for each family by y (horiz) and x (vert)
     horiz = np.array(horiz)
     vert  = np.array(vert)
 
-    # For each line, compute midpoints and use them to rank extremes
     def midpoints(lines):
-        m = (lines[:,0:2] + lines[:,2:4]) / 2.0
-        return m
+        return (lines[:,0:2] + lines[:,2:4]) / 2.0
 
     hm = midpoints(horiz); vm = midpoints(vert)
     top_idx = np.argmin(hm[:,1]); bottom_idx = np.argmax(hm[:,1])
@@ -151,12 +150,10 @@ def detect_outer_corners_hough(frame):
         return None, 0.0
 
     quad = order_quad(pts)
-    # Basic sanity: convex and inside frame
     h, w = frame.shape[:2]
     if np.any(quad[:,0] < -5) or np.any(quad[:,0] > w+5) or np.any(quad[:,1] < -5) or np.any(quad[:,1] > h+5):
         return None, 0.0
 
-    # Confidence heuristic: area and orthogonality
     def poly_area(q):
         return 0.5*abs(np.dot(q[:,0], np.roll(q[:,1], -1)) - np.dot(q[:,1], np.roll(q[:,0], -1)))
     area = poly_area(quad)
@@ -165,7 +162,7 @@ def detect_outer_corners_hough(frame):
     v1 = quad[1] - quad[0]
     v2 = quad[3] - quad[0]
     cosang = abs(np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2) + 1e-6))
-    ortho = 1 - cosang  # 1 is perfect orthogonal
+    ortho = 1 - cosang
 
     conf = 0.5*area_norm + 0.5*max(0.0, ortho)
     return quad, conf
@@ -186,11 +183,9 @@ class HomographyKeeper:
         return False
 
 def rectify_frame(frame, keeper):
-    # 1) Try grid-based homography (best when board is clear)
     H, inlier_ratio = detect_grid_homography(frame)
     conf_grid = float(inlier_ratio)
 
-    # 2) If grid fails or is weak, try 4-corner Hough
     quad, conf_hough = (None, 0.0)
     if H is None or conf_grid < 0.5:
         res = detect_outer_corners_hough(frame)
@@ -198,11 +193,9 @@ def rectify_frame(frame, keeper):
             quad, conf_hough = res
             H = homography_from_pts4(quad)
 
-    # 3) Choose confidence and update
     conf = max(conf_grid, conf_hough)
     keeper.update(H, conf)
 
-    # 4) Warp using current best H (don’t stall if detection failed this frame)
     if keeper.H is None:
         return None, conf, (conf_grid, conf_hough), None
 
@@ -210,53 +203,138 @@ def rectify_frame(frame, keeper):
     rectified = orientation_fix(rectified)
     return rectified, conf, (conf_grid, conf_hough), quad
 
-# ---------- Demo / glue ----------
+# ---------- NEW: Camera selection helpers ----------
+def _probe_source(open_arg, api_pref=None):
+    """Try to open a source (index or path). Returns (cap, (w,h)) or (None, None)."""
+    cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
+    if not cap.isOpened():
+        cap.release()
+        return None, None
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        cap.release()
+        return None, None
+    h, w = frame.shape[:2]
+    return cap, (w, h)
+
+def list_cameras():
+    """Enumerate likely camera sources and return a list of available devices."""
+    cams = []
+    key_counter = 0
+
+    # On Linux, prefer explicit device paths for stability
+    if platform.system() == 'Linux':
+        for path in sorted(glob.glob('/dev/video*')):
+            cap, res = _probe_source(path, api_pref=cv.CAP_V4L2)
+            if cap is not None:
+                cap.release()
+                key = str(key_counter)
+                key_counter += 1
+                label = f"{path} (V4L2, {res[0]}x{res[1]})"
+                cams.append({'key': key, 'label': label, 'open_arg': path, 'api': cv.CAP_V4L2})
+
+    # Fallback for other OSes or if V4L2 fails: numeric indices
+    for idx in range(SCAN_MAX_INDEX):
+        cap, res = _probe_source(idx)
+        if cap is not None:
+            cap.release()
+            key = str(key_counter)
+            key_counter += 1
+            label = f"Device Index {idx} ({res[0]}x{res[1]})"
+            cams.append({'key': key, 'label': label, 'open_arg': idx, 'api': None})
+
+    return cams
+
+def select_camera_interactive():
+    """Print a menu, let the user select a camera, and return the opened device."""
+    while True:
+        cams = list_cameras()
+        print("\n=== Select a Camera ===")
+        if not cams:
+            print("No cameras found. Connect a camera and press 'r' to rescan, or 'q' to quit.")
+        else:
+            for c in cams:
+                print(f"[{c['key']}] {c['label']}")
+        print("\n[r] Refresh List")
+        print("[q] Quit")
+        choice = input("Enter selection: ").strip().lower()
+
+        if choice == 'q':
+            return None, None
+        if choice == 'r':
+            continue
+
+        match = next((c for c in cams if c['key'] == choice), None)
+        if not match:
+            print("Invalid selection.")
+            continue
+
+        api = match['api']
+        open_arg = match['open_arg']
+        cap = cv.VideoCapture(open_arg, api) if api else cv.VideoCapture(open_arg)
+        
+        if not cap.isOpened():
+            print("Error: Failed to open the selected camera.")
+            continue
+        
+        print(f"Successfully opened camera: {match['label']}")
+        return cap, match['label']
+
+# ---------- MODIFIED: Demo / glue ----------
 def draw_debug(frame, rectified, confs, quad):
     vis = frame.copy()
     conf_grid, conf_hough = confs
-    h, w = frame.shape[:2]
     if quad is not None:
         q = quad.astype(int)
         cv.polylines(vis, [q], isClosed=True, color=(0,255,0), thickness=2)
     cv.putText(vis, f"grid:{conf_grid:.2f}  hough:{conf_hough:.2f}", (10, 30),
                cv.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv.LINE_AA)
     if rectified is not None:
-        # Overlay a light 8x8 grid on the rectified image
         tile = CANONICAL_SIZE // 8
         for i in range(9):
             cv.line(rectified, (0, i*tile), (CANONICAL_SIZE, i*tile), (128,128,128), 1)
             cv.line(rectified, (i*tile, 0), (i*tile, CANONICAL_SIZE), (128,128,128), 1)
     return vis, rectified
 
-def main():
-    # cap = cv.VideoCapture(0)  # change to your source
-    cap = cv.VideoCapture(1)
-    if not cap.isOpened():
-        print("Camera open failed.")
-        return
+def run_loop(cap, cam_label):
+    """Main video processing loop."""
     keeper = HomographyKeeper()
+    win_name = "Board Rectification"
 
     while True:
         ok, frame = cap.read()
-        if not ok: break
+        if not ok:
+            print("Camera read failed.")
+            break
 
         rectified, conf, confs, quad = rectify_frame(frame, keeper)
         if SHOW:
             vis, rect = draw_debug(frame, None if rectified is None else rectified.copy(), confs, quad)
             if rect is not None:
                 side = CANONICAL_SIZE
-                # show side-by-side
                 h = max(vis.shape[0], side)
                 canvas = np.zeros((h, vis.shape[1]+side, 3), dtype=np.uint8)
                 canvas[:vis.shape[0], :vis.shape[1]] = vis
                 canvas[:side, vis.shape[1]:vis.shape[1]+side] = rect
-                cv.imshow("Board rectification", canvas)
+                cv.putText(canvas, cam_label, (10, h - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
+                cv.imshow(win_name, canvas)
             else:
-                cv.imshow("Board rectification", vis)
+                cv.putText(vis, cam_label, (10, vis.shape[0] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
+                cv.imshow(win_name, vis)
 
         key = cv.waitKey(1) & 0xFF
         if key == 27 or key == ord('q'):
             break
+
+def main():
+    """Main function to handle camera selection and processing loop."""
+    cap, label = select_camera_interactive()
+
+    if cap is None:
+        print("No camera selected. Exiting.")
+        return
+
+    run_loop(cap, label)
 
     cap.release()
     cv.destroyAllWindows()
