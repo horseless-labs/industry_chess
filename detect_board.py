@@ -91,6 +91,59 @@ def crop_to_quad(frame, quad, pad=24, min_area_norm=0.06):
     y1 = min(int(max(quad[:,1]))+pad, h)
     return frame[y0:y1, x0:x1], (x0,y0), True, area_norm
 
+import os
+
+def _norm_codec_and_path(path, codec):
+    """
+    Normalize (fourcc, path) to avoid bad container/codec combos that trigger warnings or fail.
+    Rules:
+      - .mp4  -> prefer mp4v (MPEG-4 Part 2) since H264 encoder often missing in OpenCV builds
+      - .avi  -> XVID or MJPG are safe and common
+      - no ext -> choose based on codec
+    Returns: (fourcc_str, final_path)
+    """
+    codec = (codec or "").upper()
+    root, ext = os.path.splitext(path if path else "")
+
+    def with_ext(base, wanted_ext):
+        if not base: base = "video"
+        return (base if not base.lower().endswith(wanted_ext) else base)
+
+    # If no path provided, pick a sensible default by codec
+    if not path:
+        if codec in ("XVID", "MJPG"):
+            return codec, "video.avi"
+        elif codec in ("H264", "AVC1", "H265", "HEVC"):
+            # Most OpenCV wheels can't encode these; fall back to mp4v
+            return "mp4v", "video.mp4"
+        else:
+            # Unknown -> mp4v in mp4
+            return "mp4v", "video.mp4"
+
+    # If user gave a path, align FOURCC to extension
+    ext = ext.lower()
+    if ext in (".mp4", ".m4v"):
+        # Use mp4v for maximum write-compat without external encoders
+        if codec in ("MP4V", "M4V", "MPEG4"):
+            return "mp4v", path
+        else:
+            # Map XVID/MJPG/H264 to mp4v silently to prevent warnings
+            return "mp4v", path
+    elif ext == ".avi":
+        # AVI plays nice with XVID or MJPG
+        if codec in ("XVID", "MJPG"):
+            return codec, path
+        # If user asked for H264 in AVI, steer to XVID to keep it working
+        return "XVID", path
+    elif ext == ".mkv":
+        # MKV is flexible; still avoid H264 if encoder missing -> prefer XVID
+        if codec in ("XVID", "MJPG"):
+            return codec, path
+        return "XVID", path
+    else:
+        # Unknown extension: default to mp4/mp4v
+        return "mp4v", root + ".mp4"
+
 # ---------- Manual calibration mouse callback ----------
 def _mouse_cb(event, x, y, flags, userdata):
     global _manual_clicks, _manual_H, _manual_active
@@ -465,8 +518,15 @@ def make_timestamped(base, ext):
     return f"{root}_{stamp}{ext}"
 
 def create_writer(path, size, fps, fourcc_str="MJPG"):
+    fourcc_str, path = _norm_codec_and_path(path, fourcc_str)
     fourcc = cv.VideoWriter_fourcc(*fourcc_str)
-    return cv.VideoWriter(path, fourcc, fps, size)
+    writer = cv.VideoWriter(path, fourcc, fps, size)
+    if not writer.isOpened():
+        print(f"[REC] ERROR: Could not open writer for {path} with FOURCC {fourcc_str}")
+    else:
+        print(f"[REC] Using container for {os.path.splitext(path)[1].lower()} with FOURCC {fourcc_str}")
+    return writer, path
+
 
 class DualRecorder:
     def __init__(self, orig_path=None, rect_path=None, fps=30, codec="MJPG"):
@@ -488,13 +548,14 @@ class DualRecorder:
             self._orig_size = (w, h)
             self._sizes_ready = True
         if self.orig_writer is None:
-            path = self.orig_path or make_timestamped("orig.avi", ".avi")
-            self.orig_writer = create_writer(path, self._orig_size, self.fps, self.codec)
-            print(f"[REC] Writing original to {path} @ {self._orig_size} {self.fps}fps {self.codec}")
+            path = self.orig_path or make_timestamped("orig.mp4", ".mp4")
+            self.orig_writer, final_path = create_writer(path, self._orig_size, self.fps, self.codec)
+            print(f"[REC] Writing original to {final_path} @ {self._orig_size} {self.fps}fps")
+
         if self.rect_writer is None:
-            path = self.rect_path or make_timestamped("rect.avi", ".avi")
-            self.rect_writer = create_writer(path, self._rect_size, self.fps, self.codec)
-            print(f"[REC] Writing rectified to {path} @ {self._rect_size} {self.fps}fps {self.codec}")
+            path = self.rect_path or make_timestamped("rect.mp4", ".mp4")
+            self.rect_writer, final_path = create_writer(path, self._rect_size, self.fps, self.codec)
+            print(f"[REC] Writing rectified to {final_path} @ {self._rect_size} {self.fps}fps")
 
     def write(self, frame_bgr, rectified_bgr):
         if not self.enabled: return
@@ -650,7 +711,7 @@ def parse_args():
     ap.add_argument("--orig", type=str, default=None, help="Output path for original video (e.g., orig.avi)")
     ap.add_argument("--rect", type=str, default=None, help="Output path for rectified video (e.g., rect.avi)")
     ap.add_argument("--fps", type=int, default=30, help="Recording FPS")
-    ap.add_argument("--codec", type=str, default="MJPG", help="FOURCC codec (e.g., MJPG, XVID, H264)")
+    ap.add_argument("--codec", type=str, default="XVID", help="FOURCC codec (e.g., XVID, MJPG, H264)")
     return ap.parse_args()
 
 def main():
