@@ -16,3 +16,6 @@ Camera read failed.
 Problems:
 - `detect_board.py` consistently chooses a region of the video feed that is too small, merely a portion of the board.
 - Once that region is locked in, it seems that no updates are possible.
+
+## 1352
+Added the ability to manually recalibrate for the board. Something about the auto detector is too spotty; must remember to investigate later.
