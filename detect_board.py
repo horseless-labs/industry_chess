@@ -3,8 +3,23 @@ import numpy as np
 from collections import deque
 import glob, platform, time
 
+cap = cv.VideoCapture(0, cv.CAP_V4L2)  # Use V4L2 backend on Linux
+
+# request resolution
+cap.set(cv.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv.CAP_PROP_FRAME_HEIGHT, 1080)
+cap.set(cv.CAP_PROP_FPS, 30)
+cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+
+# confirm what we actually got
+w = cap.get(cv.CAP_PROP_FRAME_WIDTH)
+h = cap.get(cv.CAP_PROP_FRAME_HEIGHT)
+fps = cap.get(cv.CAP_PROP_FPS)
+print(f"Actual: {w}x{h} @ {fps}fps")
+
+
 # ---------- Config ----------
-CANONICAL_SIZE = 512          # output board size (px)
+CANONICAL_SIZE = 768          # output board size (px)
 BOARD_INNER = (7, 7)          # 7x7 inner corners for an 8x8 board
 EDGE_TH = (60, 180)           # Canny thresholds for Hough fallback
 MIN_LINE_LEN = 120            # HoughP min line length
@@ -398,18 +413,58 @@ def list_cameras():
         cams.append({'key': str(key), 'label': f"Device Index {idx}", 'open_arg': idx, 'api': None}); key += 1
     return cams
 
+# def _open_camera(open_arg, api_pref):
+#     cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
+#     if not cap.isOpened(): return None
+#     for prop, val in [(cv.CAP_PROP_BUFFERSIZE,1),(cv.CAP_PROP_FPS,30),
+#                       (cv.CAP_PROP_FRAME_WIDTH,1280),(cv.CAP_PROP_FRAME_HEIGHT,720)]:
+#         try: cap.set(prop, val)
+#         except: pass
+#     try: cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+#     except: pass
+#     ok, _ = cap.read()
+#     if not ok:
+#         cap.release(); return None
+#     return cap
+
 def _open_camera(open_arg, api_pref):
+    """
+    Safely open a camera with preferred backend and high-resolution settings.
+    Returns an initialized cv.VideoCapture object or None on failure.
+    """
+    # Create the capture object (with backend if specified)
     cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
-    if not cap.isOpened(): return None
-    for prop, val in [(cv.CAP_PROP_BUFFERSIZE,1),(cv.CAP_PROP_FPS,30),
-                      (cv.CAP_PROP_FRAME_WIDTH,1280),(cv.CAP_PROP_FRAME_HEIGHT,720)]:
-        try: cap.set(prop, val)
-        except: pass
-    try: cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
-    except: pass
-    ok, _ = cap.read()
-    if not ok:
-        cap.release(); return None
+    if not cap.isOpened():
+        print("Error: Could not open camera.")
+        return None
+
+    # --- Requested capture settings ---
+    try:
+        # Compression: use MJPG to unlock higher resolutions on most USB webcams
+        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+        # Resolution (adjust as supported)
+        cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+        # Framerate
+        cap.set(cv.CAP_PROP_FPS, 30)
+        # Reduce internal buffering (fresher frames)
+        cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+    except Exception as e:
+        print("Warning: failed to set some camera properties:", e)
+
+    # --- Confirm actual values ---
+    actual_w = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv.CAP_PROP_FPS)
+    print(f"Camera opened at {actual_w}x{actual_h} @ {actual_fps:.1f} FPS")
+
+    # --- Test the stream ---
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        print("Error: failed to read initial frame.")
+        cap.release()
+        return None
+
     return cap
 
 def select_camera_interactive():
