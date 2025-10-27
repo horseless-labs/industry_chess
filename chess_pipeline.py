@@ -509,9 +509,6 @@ def train_yolo_ultralytics(
     batch: int = 16,
     lr0: float = 0.001,
 ):
-    """
-    Train YOLO using the Ultralytics Python API.
-    """
     try:
         from ultralytics import YOLO
     except Exception as e:
@@ -522,8 +519,7 @@ def train_yolo_ultralytics(
 
     print(f"Starting YOLO training: model={model_name} epochs={epochs} imgsz={imgsz} batch={batch}")
     model = YOLO(model_name)
-    # Conservative augmentation for tiny datasets
-    results = model.train(
+    out = model.train(
         data=str(dataset_yaml),
         epochs=epochs,
         imgsz=imgsz,
@@ -533,10 +529,35 @@ def train_yolo_ultralytics(
         hsv_h=0.0, hsv_s=0.2, hsv_v=0.2,
         degrees=1.0, translate=0.05, scale=0.10,
         device=0 if torch.cuda.is_available() else "cpu",
+        workers=0, persistent_workers=False,  # safer on low-RAM/VRAM
     )
-    print("YOLO training complete. Results directory:", results.save_dir)
-    return results
 
+    # Be tolerant to API differences
+    save_dir = None
+    best = None
+    last = None
+    tr = getattr(model, "trainer", None)
+    if tr is not None:
+        save_dir = getattr(tr, "save_dir", None)
+        ckpts = getattr(tr, "ckpt", {}) or {}
+        best = ckpts.get("best") if isinstance(ckpts, dict) else None
+        # Newer releases store best path separately
+        best = best or getattr(tr, "best", None)
+        last = getattr(tr, "last", None)
+
+    # Some versions return a Results-like object with save_dir
+    if save_dir is None and hasattr(out, "save_dir"):
+        save_dir = out.save_dir
+
+    print("YOLO training complete.")
+    if save_dir:
+        print("Results directory:", save_dir)
+    if best:
+        print("Best weights:", best)
+    if last:
+        print("Last weights:", last)
+
+    return {"save_dir": save_dir, "best": best, "last": last}
 
 # ---------------------------
 # Main
