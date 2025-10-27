@@ -3,3 +3,7 @@
 *.sqlite3
 *.swp
 *.txt
+runs/
+wandb/
+yolo_export/
+yolov8n.pt
