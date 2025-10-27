@@ -529,7 +529,7 @@ def train_yolo_ultralytics(
         hsv_h=0.0, hsv_s=0.2, hsv_v=0.2,
         degrees=1.0, translate=0.05, scale=0.10,
         device=0 if torch.cuda.is_available() else "cpu",
-        workers=0, persistent_workers=False,  # safer on low-RAM/VRAM
+        workers=0  # safer on low-RAM/VRAM
     )
 
     # Be tolerant to API differences
