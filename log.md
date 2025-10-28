@@ -30,3 +30,24 @@ Currently wondering if the code for detection of the board should just be remove
 # 2025-10-26
 ## 2133
 Added the pipeline for actually training. We have some preliminary data based on a 52-second video of just setting up the board. The next step will be collecting data in earnest.
+
+# 2025-10-27
+## 2044
+Working out a recording pipeline. Worth noting that no matter what order we select the coordinates for the board, it places them... I don't want to say it's always upside-down, but it *is* something that we'll need to pay attention to.
+
+The recordings need to be moved, renamed, etc. Right now, we are taking examples from Bobby Fischer Plays Chess. The following is a list of the exercies:
+- 13 (noticed board was upside down)
+- 14 (x2, becasue we had bowls of pieces behind and don't want the model to get confused.)
+- 15
+- 16
+- 17
+- 17, but the pieces were already set and we just rotated the board a bit.
+- 18 (x3, because we are unsure how to handle when we place a piece a little on a line, and had a cup of coffee in the background)
+- 19 (first time moving pieces on the board, recorded several of with different board rotations)
+- 22 (x2, from a different angle)
+- 23 (x2 normal, one simple rotation)
+- 24
+
+## 2158
+TODO: organize video files output from `record_with_homography.py`, JSON files output from LabelStudio, etc.
+TODO: Rewrite where code outputs any files
