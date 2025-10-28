@@ -26,3 +26,7 @@ Currently wondering if the code for detection of the board should just be remove
 - Attempt auto-calibration on other surfaces and lighting conditions.
 - Try different tape or bright corner markers on the board.
 - Adjust thresholds in the code itself.
+
+# 2025-10-26
+## 2133
+Added the pipeline for actually training. We have some preliminary data based on a 52-second video of just setting up the board. The next step will be collecting data in earnest.
