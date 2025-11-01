@@ -179,24 +179,36 @@ class AnnotationAdapter:
         self.class_set = set(self.class_names)
         
         # Get base directory (YAML location)
-        base_dir = self.data_yaml.parent
+        base_dir = self.data_yaml.parent.resolve()
         
         # Process train and val splits
         for split in ['train', 'val', 'test']:
             if split not in config:
                 continue
             
-            # Get images directory
-            img_dir = base_dir / config[split]
+            # Get images directory - resolve relative to YAML file
+            img_dir_rel = config[split]
+            if img_dir_rel.startswith('../'):
+                # Path is relative to YAML file
+                img_dir = (base_dir / img_dir_rel).resolve()
+            else:
+                # Try as-is first, then relative to YAML
+                img_dir = Path(img_dir_rel)
+                if not img_dir.is_absolute():
+                    img_dir = (base_dir / img_dir_rel).resolve()
+            
             if not img_dir.exists():
                 print(f"Warning: {split} images dir not found: {img_dir}")
                 continue
             
             # Corresponding labels directory
+            # Typically images/labels are siblings, so go up one level
             labels_dir = img_dir.parent / 'labels'
             if not labels_dir.exists():
                 print(f"Warning: {split} labels dir not found: {labels_dir}")
                 continue
+            
+            print(f"Processing {split}: {img_dir}")
             
             # Process each image
             for img_path in img_dir.glob('*'):
@@ -632,17 +644,40 @@ def main():
     
     # Get all image paths
     all_images = []
-    for img_file in index.keys():
-        # Try to find the full path
-        if args.format == 'yolo' and args.data_yaml:
-            base_dir = args.data_yaml.parent
-            for split in ['train', 'val', 'test']:
-                img_dir = base_dir / f"../{split}/images"
+    seen_files = set()  # Track to avoid duplicates
+    
+    if args.format == 'yolo' and args.data_yaml:
+        base_dir = args.data_yaml.parent.resolve()
+        
+        # Load YAML to get paths
+        with open(args.data_yaml, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        for split in ['train', 'val', 'test']:
+            if split not in config:
+                continue
+            
+            # Resolve image directory
+            img_dir_rel = config[split]
+            if img_dir_rel.startswith('../'):
+                img_dir = (base_dir / img_dir_rel).resolve()
+            else:
+                img_dir = Path(img_dir_rel)
+                if not img_dir.is_absolute():
+                    img_dir = (base_dir / img_dir_rel).resolve()
+            
+            if not img_dir.exists():
+                continue
+            
+            # Find all images that have annotations
+            for img_file in index.keys():
                 img_path = img_dir / img_file
-                if img_path.exists():
-                    all_images.append(img_path.resolve())
-                    break
-        elif frames_dir:
+                if img_path.exists() and img_file not in seen_files:
+                    all_images.append(img_path)
+                    seen_files.add(img_file)
+    
+    elif frames_dir:
+        for img_file in index.keys():
             img_path = frames_dir / img_file
             if img_path.exists():
                 all_images.append(img_path)
