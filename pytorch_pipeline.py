@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Train a chess-piece detector in PyTorch (torchvision Faster R-CNN) from a
-small JSON created from ONE video. Designed to be schema-tolerant and
-work even with tiny datasets via transfer learning + heavy regularization.
+Train a chess-piece detector in PyTorch (torchvision Faster R-CNN) from
+various annotation formats including YOLO, COCO, and Label Studio.
 
-Usage (typical):
+Usage with YOLO format (Roboflow):
   python chess_detector_training.py \
+    --format yolo \
+    --data_yaml data/data.yaml \
+    --out runs/exp1
+
+Usage with Label Studio JSON:
+  python chess_detector_training.py \
+    --format labelstudio \
     --video data/chess.mp4 \
     --json data/annotations.json \
     --out runs/exp1 \
     --classes white_pawn white_rook white_knight white_bishop white_queen white_king \
               black_pawn black_rook black_knight black_bishop black_queen black_king
 
-If you already extracted frames, pass --frames_dir instead of --video.
-If your JSON is in Label Studio (video) or a COCO-like custom format, the
-adapter will try to auto-detect. If your schema differs, edit
-`adapter_build_index()` near the TODO blocks.
+Usage with COCO format:
+  python chess_detector_training.py \
+    --format coco \
+    --json data/annotations.json \
+    --frames_dir data/frames \
+    --out runs/exp1
 """
 
 import argparse
@@ -27,6 +35,7 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import cv2
 import torch
+import yaml
 from PIL import Image
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -120,46 +129,214 @@ def _norm_to_abs(
 class AnnotationAdapter:
     """Handles multiple annotation schema formats."""
     
-    def __init__(self, json_path: Path, frames_dir: Path, class_names: List[str]):
+    def __init__(
+        self,
+        format_type: str,
+        class_names: Optional[List[str]] = None,
+        json_path: Optional[Path] = None,
+        frames_dir: Optional[Path] = None,
+        data_yaml: Optional[Path] = None
+    ):
+        self.format_type = format_type.lower()
         self.json_path = json_path
         self.frames_dir = frames_dir
-        self.class_set = set(class_names)
+        self.data_yaml = data_yaml
+        self.class_names = class_names
+        self.class_set = set(class_names) if class_names else set()
         self.index: Dict[str, List[Dict[str, Any]]] = {}
         
     def build_index(self) -> Dict[str, List[Dict[str, Any]]]:
         """Build index mapping image filename -> list of annotations."""
-        data = json.loads(self.json_path.read_text())
-        
-        # Try different schema parsers
-        if self._try_coco_schema(data):
-            return self.index
-        if self._try_label_studio_schema(data):
-            return self.index
-        if self._try_custom_schema(data):
-            return self.index
-        
-        raise ValueError(
-            "Unrecognized JSON schema. Edit AnnotationAdapter to map your fields."
-        )
+        if self.format_type == 'yolo':
+            return self._build_yolo_index()
+        elif self.format_type == 'labelstudio':
+            return self._build_labelstudio_index()
+        elif self.format_type == 'coco':
+            return self._build_coco_index()
+        else:
+            raise ValueError(f"Unsupported format: {self.format_type}")
     
     def _add_record(self, img_file: str, bbox_xyxy: List[float], label: str) -> None:
         """Add annotation record if label is in our class set."""
-        if label not in self.class_set:
+        if self.class_set and label not in self.class_set:
             return
         self.index.setdefault(img_file, []).append({
             "bbox": bbox_xyxy,
             "label": label
         })
     
-    def _try_coco_schema(self, data: Any) -> bool:
-        """Try parsing COCO-like schema."""
+    def _build_yolo_index(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Build index from YOLO format (Roboflow style)."""
+        if not self.data_yaml:
+            raise ValueError("data_yaml required for YOLO format")
+        
+        # Load YAML config
+        with open(self.data_yaml, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # Get class names from YAML
+        self.class_names = config['names']
+        self.class_set = set(self.class_names)
+        
+        # Get base directory (YAML location)
+        base_dir = self.data_yaml.parent
+        
+        # Process train and val splits
+        for split in ['train', 'val', 'test']:
+            if split not in config:
+                continue
+            
+            # Get images directory
+            img_dir = base_dir / config[split]
+            if not img_dir.exists():
+                print(f"Warning: {split} images dir not found: {img_dir}")
+                continue
+            
+            # Corresponding labels directory
+            labels_dir = img_dir.parent / 'labels'
+            if not labels_dir.exists():
+                print(f"Warning: {split} labels dir not found: {labels_dir}")
+                continue
+            
+            # Process each image
+            for img_path in img_dir.glob('*'):
+                if img_path.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
+                    continue
+                
+                # Load image to get dimensions
+                with Image.open(img_path) as im:
+                    W, H = im.size
+                
+                # Find corresponding label file
+                label_path = labels_dir / f"{img_path.stem}.txt"
+                if not label_path.exists():
+                    continue
+                
+                # Parse YOLO format labels
+                with open(label_path, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) != 5:
+                            continue
+                        
+                        class_id = int(parts[0])
+                        cx, cy, w, h = map(float, parts[1:])
+                        
+                        # Convert from normalized cxcywh to absolute xyxy
+                        cx_abs = cx * W
+                        cy_abs = cy * H
+                        w_abs = w * W
+                        h_abs = h * H
+                        
+                        x1 = cx_abs - w_abs / 2
+                        y1 = cy_abs - h_abs / 2
+                        x2 = cx_abs + w_abs / 2
+                        y2 = cy_abs + h_abs / 2
+                        
+                        label = self.class_names[class_id]
+                        self._add_record(img_path.name, [x1, y1, x2, y2], label)
+        
+        return self.index
+    
+    def _build_labelstudio_index(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Build index from Label Studio video export."""
+        if not self.json_path or not self.frames_dir:
+            raise ValueError("json_path and frames_dir required for Label Studio format")
+        
+        data = json.loads(self.json_path.read_text())
+        
+        if not isinstance(data, list):
+            raise ValueError("Label Studio format should be a list of tasks")
+        
+        for task in data:
+            results = []
+            anns = task.get("annotations", [])
+            if anns:
+                for a in anns:
+                    results.extend(a.get("result", []))
+            else:
+                results = task.get("result", [])
+            
+            for r in results:
+                val = r.get("value", {})
+                
+                # Handle video rectangle format with sequence
+                if "sequence" in val:
+                    labels = val.get("labels", ["object"])
+                    if isinstance(labels, list):
+                        label = labels[0]
+                    else:
+                        label = str(labels)
+                    
+                    for seq_item in val["sequence"]:
+                        if not seq_item.get("enabled", True):
+                            continue
+                        
+                        frame_idx = seq_item.get("frame")
+                        if frame_idx is None:
+                            continue
+                        
+                        img_file = f"frame_{int(frame_idx)+1:06d}.jpg"
+                        img_path = self.frames_dir / img_file
+                        if not img_path.exists():
+                            continue
+                        
+                        with Image.open(img_path) as im:
+                            W, H = im.size
+                        
+                        x = seq_item.get("x", 0)
+                        y = seq_item.get("y", 0)
+                        w = seq_item.get("width", 0)
+                        h = seq_item.get("height", 0)
+                        
+                        ax, ay, aw, ah = _norm_to_abs(x, y, w, h, W, H)
+                        bbox_xyxy = [ax, ay, ax + aw, ay + ah]
+                        
+                        self._add_record(img_file, bbox_xyxy, str(label))
+                
+                # Handle single frame format
+                elif {"x", "y", "width", "height"} <= set(val.keys()):
+                    frame_idx = r.get("frame")
+                    if frame_idx is None:
+                        continue
+                    
+                    img_file = f"frame_{int(frame_idx)+1:06d}.jpg"
+                    img_path = self.frames_dir / img_file
+                    if not img_path.exists():
+                        continue
+                    
+                    with Image.open(img_path) as im:
+                        W, H = im.size
+                    
+                    x, y, w, h = val["x"], val["y"], val["width"], val["height"]
+                    ax, ay, aw, ah = _norm_to_abs(x, y, w, h, W, H)
+                    bbox_xyxy = [ax, ay, ax + aw, ay + ah]
+                    
+                    label = val.get("rectanglelabels", val.get("labels", ["object"]))
+                    if isinstance(label, list):
+                        label = label[0]
+                    
+                    self._add_record(img_file, bbox_xyxy, str(label))
+        
+        return self.index
+    
+    def _build_coco_index(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Build index from COCO format."""
+        if not self.json_path:
+            raise ValueError("json_path required for COCO format")
+        
+        data = json.loads(self.json_path.read_text())
+        
         if not isinstance(data, dict) or not all(k in data for k in ("images", "annotations")):
-            return False
+            raise ValueError("Invalid COCO format")
         
         images = {im["id"]: im for im in data["images"]}
         id_to_cat = {}
         if "categories" in data:
             id_to_cat = {c["id"]: c["name"] for c in data["categories"]}
+            if not self.class_names:
+                self.class_names = [c["name"] for c in sorted(data["categories"], key=lambda x: x["id"])]
+                self.class_set = set(self.class_names)
         
         for ann in data["annotations"]:
             img_info = images.get(ann["image_id"])
@@ -176,100 +353,7 @@ class AnnotationAdapter:
             )
             self._add_record(file_name, [x1, y1, x2, y2], label)
         
-        return bool(self.index)
-    
-    def _try_label_studio_schema(self, data: Any) -> bool:
-        """Try parsing Label Studio video export schema."""
-        if not isinstance(data, list):
-            return False
-        
-        for task in data:
-            results = []
-            anns = task.get("annotations", [])
-            if anns:
-                for a in anns:
-                    results.extend(a.get("result", []))
-            else:
-                results = task.get("result", [])
-            
-            for r in results:
-                val = r.get("value", {})
-                if not {"x", "y", "width", "height"} <= set(val.keys()):
-                    continue
-                
-                frame_idx = r.get("frame")
-                if frame_idx is None:
-                    continue
-                
-                img_file = f"frame_{int(frame_idx)+1:06d}.jpg"
-                img_path = self.frames_dir / img_file
-                if not img_path.exists():
-                    continue
-                
-                with Image.open(img_path) as im:
-                    W, H = im.size
-                
-                x, y, w, h = val["x"], val["y"], val["width"], val["height"]
-                ax, ay, aw, ah = _norm_to_abs(x, y, w, h, W, H)
-                bbox_xyxy = [ax, ay, ax + aw, ay + ah]
-                
-                label = val.get("rectanglelabels", val.get("labels", ["object"]))
-                if isinstance(label, list):
-                    label = label[0]
-                
-                self._add_record(img_file, bbox_xyxy, str(label))
-        
-        return bool(self.index)
-    
-    def _try_custom_schema(self, data: Any) -> bool:
-        """Try parsing custom schema with frames list."""
-        if not isinstance(data, dict) or "frames" not in data:
-            return False
-        
-        for f in data["frames"]:
-            img_file = f.get("file") or f.get("filename")
-            if not img_file:
-                frame_n = f.get("frame")
-                if frame_n is None:
-                    continue
-                img_file = f"frame_{int(frame_n)+1:06d}.jpg"
-            
-            objects = f.get("objects", [])
-            img_path = self.frames_dir / img_file
-            
-            W = H = None
-            if img_path.exists():
-                with Image.open(img_path) as im:
-                    W, H = im.size
-            
-            for obj in objects:
-                label = obj.get("label", obj.get("class", "object"))
-                bbox = obj.get("bbox") or obj.get("xywh")
-                fmt = (obj.get("format") or obj.get("fmt") or "xywh").lower()
-                normalized = obj.get("normalized", False)
-                
-                if not bbox or len(bbox) != 4:
-                    continue
-                
-                x, y, w, h = bbox
-                if normalized and W is not None and H is not None:
-                    x, y, w, h = _norm_to_abs(x, y, w, h, W, H)
-                
-                if fmt == "xywh":
-                    bbox_xyxy = [x, y, x + w, y + h]
-                elif fmt == "cxcywh":
-                    bbox_xyxy = box_convert(
-                        torch.tensor([[x, y, w, h]], dtype=torch.float32),
-                        "cxcywh",
-                        "xyxy"
-                    ).tolist()[0]
-                else:
-                    # Assume already xyxy
-                    bbox_xyxy = [x, y, w, h]
-                
-                self._add_record(img_file, bbox_xyxy, str(label))
-        
-        return bool(self.index)
+        return self.index
 
 
 # ---------------------------
@@ -281,27 +365,32 @@ class ChessDetDataset(Dataset):
     
     def __init__(
         self,
-        frames_dir: Path,
+        image_paths: List[Path],
         index: Dict[str, List[Dict[str, Any]]],
         label_to_id: Dict[str, int],
         augment: bool = True
     ):
-        self.frames_dir = frames_dir
-        self.items = sorted(index.keys())
+        """
+        Args:
+            image_paths: List of full paths to images
+            index: Dict mapping image filename to annotations
+            label_to_id: Mapping from label name to class id
+            augment: Whether to apply augmentation
+        """
+        self.image_paths = image_paths
         self.index = index
         self.label_to_id = label_to_id
         self.augment = augment
     
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.image_paths)
     
     def __getitem__(self, i: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        fname = self.items[i]
-        img_path = self.frames_dir / fname
+        img_path = self.image_paths[i]
         img = Image.open(img_path).convert("RGB")
         W, H = img.size
         
-        anns = self.index.get(fname, [])
+        anns = self.index.get(img_path.name, [])
         boxes = []
         labels = []
         areas = []
@@ -366,14 +455,13 @@ def freeze_backbone_layers(model: nn.Module) -> None:
 # ---------------------------
 
 def split_train_val(
-    files: List[str],
-    val_every_n: int = 10
-) -> Tuple[List[str], List[str]]:
+    files: List[Path],
+    val_ratio: float = 0.1
+) -> Tuple[List[Path], List[Path]]:
     """Split files into train and validation sets."""
-    train, val = [], []
-    for idx, f in enumerate(sorted(files)):
-        (val if idx % val_every_n == 0 else train).append(f)
-    return train, val
+    random.shuffle(files)
+    val_size = int(len(files) * val_ratio)
+    return files[val_size:], files[:val_size]
 
 
 # ---------------------------
@@ -448,19 +536,29 @@ def evaluate_loss(
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train chess piece detector from video annotations"
+        description="Train chess piece detector from various annotation formats"
     )
     
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument('--video', type=Path, help='Path to source video')
-    src.add_argument('--frames_dir', type=Path, help='Directory with extracted frames')
+    parser.add_argument('--format', type=str, required=True,
+                       choices=['yolo', 'labelstudio', 'coco'],
+                       help='Annotation format type')
     
-    parser.add_argument('--json', type=Path, required=True,
-                       help='Annotation JSON path')
+    # YOLO format args
+    parser.add_argument('--data_yaml', type=Path,
+                       help='Path to YOLO data.yaml (required for YOLO format)')
+    
+    # Label Studio format args
+    parser.add_argument('--video', type=Path,
+                       help='Path to source video (for Label Studio format)')
+    parser.add_argument('--frames_dir', type=Path,
+                       help='Directory with extracted frames')
+    parser.add_argument('--json', type=Path,
+                       help='Annotation JSON path (for Label Studio/COCO formats)')
+    parser.add_argument('--classes', nargs='+',
+                       help='List of class names (optional, auto-detected from data)')
+    
     parser.add_argument('--out', type=Path, required=True,
                        help='Output directory for checkpoints and logs')
-    parser.add_argument('--classes', nargs='+', required=True,
-                       help='List of class names (no background)')
     
     parser.add_argument('--extract_every', type=int, default=1,
                        help='Sample every Nth frame when extracting')
@@ -472,12 +570,14 @@ def parse_args() -> argparse.Namespace:
                        help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=5e-4,
                        help='Weight decay for regularization')
-    parser.add_argument('--val_every_n', type=int, default=10,
-                       help='Use every Nth frame for validation split')
+    parser.add_argument('--val_ratio', type=float, default=0.1,
+                       help='Validation split ratio (for YOLO format, uses existing splits)')
     parser.add_argument('--seed', type=int, default=1337,
                        help='Random seed for reproducibility')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loader workers')
+    parser.add_argument('--freeze_backbone', action='store_true',
+                       help='Freeze early backbone layers (recommended for small datasets)')
     
     return parser.parse_args()
 
@@ -492,37 +592,70 @@ def main():
     
     ensure_dir(args.out)
     
-    # Handle frame extraction
+    # Handle frame extraction for Label Studio
     frames_dir = args.frames_dir
-    if args.video is not None:
-        frames_dir = args.out / 'frames'
-        if frames_dir.exists():
-            shutil.rmtree(frames_dir)
-        print(f"Extracting frames from {args.video} -> {frames_dir}")
-        extract_frames_from_video(args.video, frames_dir, every_n=args.extract_every)
-    
-    assert frames_dir is not None, "frames_dir must be set"
+    if args.format == 'labelstudio':
+        if args.video is not None:
+            frames_dir = args.out / 'frames'
+            if frames_dir.exists():
+                shutil.rmtree(frames_dir)
+            print(f"Extracting frames from {args.video} -> {frames_dir}")
+            extract_frames_from_video(args.video, frames_dir, every_n=args.extract_every)
+        
+        if not frames_dir:
+            raise ValueError("Label Studio format requires either --video or --frames_dir")
     
     # Build annotation index
-    print("Parsing JSON and building index...")
-    adapter = AnnotationAdapter(args.json, frames_dir, args.classes)
+    print("Parsing annotations and building index...")
+    adapter = AnnotationAdapter(
+        format_type=args.format,
+        class_names=args.classes,
+        json_path=args.json,
+        frames_dir=frames_dir,
+        data_yaml=args.data_yaml
+    )
     index = adapter.build_index()
     
+    if not index:
+        raise ValueError("No annotations found! Check your data paths and format.")
+    
+    # Get class names (from adapter if auto-detected)
+    class_names = adapter.class_names or args.classes
+    if not class_names:
+        raise ValueError("No class names found. Specify --classes or use format with class info.")
+    
+    print(f"Found {len(class_names)} classes: {class_names}")
+    
     # Create label mapping (torchvision expects class ids starting at 1)
-    class_names = list(dict.fromkeys(args.classes))  # Stable order, unique
+    class_names = list(dict.fromkeys(class_names))  # Stable order, unique
     label_to_id = {name: i + 1 for i, name in enumerate(class_names)}
     
-    # Train/val split
-    files = sorted(index.keys())
-    train_files, val_files = split_train_val(files, val_every_n=args.val_every_n)
-    print(f"Train images: {len(train_files)} | Val images: {len(val_files)}")
+    # Get all image paths
+    all_images = []
+    for img_file in index.keys():
+        # Try to find the full path
+        if args.format == 'yolo' and args.data_yaml:
+            base_dir = args.data_yaml.parent
+            for split in ['train', 'val', 'test']:
+                img_dir = base_dir / f"../{split}/images"
+                img_path = img_dir / img_file
+                if img_path.exists():
+                    all_images.append(img_path.resolve())
+                    break
+        elif frames_dir:
+            img_path = frames_dir / img_file
+            if img_path.exists():
+                all_images.append(img_path)
     
-    train_index = {f: index[f] for f in train_files}
-    val_index = {f: index[f] for f in val_files}
+    print(f"Found {len(all_images)} images with annotations")
+    
+    # Train/val split
+    train_images, val_images = split_train_val(all_images, val_ratio=args.val_ratio)
+    print(f"Train images: {len(train_images)} | Val images: {len(val_images)}")
     
     # Create datasets
-    train_ds = ChessDetDataset(frames_dir, train_index, label_to_id, augment=True)
-    val_ds = ChessDetDataset(frames_dir, val_index, label_to_id, augment=False)
+    train_ds = ChessDetDataset(train_images, index, label_to_id, augment=True)
+    val_ds = ChessDetDataset(val_images, index, label_to_id, augment=False)
     
     train_loader = DataLoader(
         train_ds,
@@ -542,7 +675,11 @@ def main():
     # Build model
     num_classes = 1 + len(class_names)  # +1 for background
     model = build_model(num_classes)
-    freeze_backbone_layers(model)  # Freeze early layers for tiny datasets
+    
+    if args.freeze_backbone:
+        freeze_backbone_layers(model)
+        print("Froze early backbone layers")
+    
     model.to(device)
     
     # Setup optimizer and scheduler
