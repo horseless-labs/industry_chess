@@ -337,10 +337,32 @@ def point_to_square(x, y):
     return f"{file_char}{rank_num}"
 
 
+def assign_detections_to_warped(detections):
+    """
+    Map detections (already in warped board space) directly to squares.
+    Returns dict: {square_name: detection}
+    """
+    square_map = {}
+    
+    for det in detections:
+        cx, cy = det["center"]
+        square = point_to_square(cx, cy)
+        
+        if square is None:
+            continue
+        
+        # If multiple pieces map to same square, keep highest confidence
+        if square not in square_map or det["confidence"] > square_map[square]["confidence"]:
+            square_map[square] = det
+    
+    return square_map
+
+
 def assign_detections_to_squares(detections, H):
     """
     Map detections from frame space to board squares using homography.
     Returns dict: {square_name: detection}
+    (DEPRECATED: Use assign_detections_to_warped when detecting on warped image)
     """
     square_map = {}
     
@@ -459,6 +481,58 @@ def compare_fen(detected_fen, target_fen):
 # --------------------------------------------
 # VISUALIZATION
 # --------------------------------------------
+def draw_board_overlay_warped(frame, warped, square_map, H):
+    """Draw detected pieces from warped space back onto original frame."""
+    overlay = frame.copy()
+    H_inv = np.linalg.inv(H)
+    
+    # Draw board outline
+    corners = np.array([
+        [0, 0],
+        [BOARD_SIZE, 0],
+        [BOARD_SIZE, BOARD_SIZE],
+        [0, BOARD_SIZE]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    
+    frame_corners = cv2.perspectiveTransform(corners, H_inv).astype(np.int32)
+    cv2.polylines(overlay, [frame_corners], True, (0, 255, 0), 3)
+    
+    # Draw grid
+    for i in range(1, 8):
+        # Vertical lines
+        line_start = np.array([[[i * SQUARE_SIZE, 0]]], dtype=np.float32)
+        line_end = np.array([[[i * SQUARE_SIZE, BOARD_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+        
+        # Horizontal lines
+        line_start = np.array([[[0, i * SQUARE_SIZE]]], dtype=np.float32)
+        line_end = np.array([[[BOARD_SIZE, i * SQUARE_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+    
+    # Draw square labels (transform centers back to frame space)
+    for square, det in square_map.items():
+        color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+        
+        # Get center in warped space
+        cx_warped, cy_warped = det['center']
+        
+        # Transform back to frame space
+        pt_warped = np.array([[[cx_warped, cy_warped]]], dtype=np.float32)
+        pt_frame = cv2.perspectiveTransform(pt_warped, H_inv)[0][0]
+        
+        cx_frame, cy_frame = int(pt_frame[0]), int(pt_frame[1])
+        
+        cv2.circle(overlay, (cx_frame, cy_frame), 5, color, -1)
+        cv2.putText(overlay, square, (cx_frame + 10, cy_frame),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return overlay
+
+
 def draw_board_overlay(frame, square_map, H):
     """Draw detected pieces on the original frame."""
     overlay = frame.copy()
@@ -559,11 +633,14 @@ def main():
         
         # Process frame if we have homography
         if H is not None:
-            # Detect pieces
-            detections = detect_pieces(model, frame, args.conf)
+            # WARP FIRST, then detect on warped image
+            warped = warp_board(frame, H)
             
-            # Map to squares
-            square_map = assign_detections_to_squares(detections, H)
+            # Detect pieces on warped board (better for model)
+            detections = detect_pieces(model, warped, args.conf)
+            
+            # Map to squares (detections already in warped space)
+            square_map = assign_detections_to_warped(detections)
             
             # Generate FEN
             fen = square_map_to_fen(square_map)
@@ -572,16 +649,36 @@ def main():
             if fen != last_fen:
                 print(f"\nFEN: {fen}")
                 print(f"Pieces detected: {len(square_map)}")
+                # Print piece positions for debugging
+                if square_map:
+                    squares_sorted = sorted(square_map.keys())
+                    print(f"Squares: {', '.join(squares_sorted)}")
                 last_fen = fen
             
-            # Draw overlay
-            disp = draw_board_overlay(frame, square_map, H)
+            # Draw overlay on original frame
+            disp = draw_board_overlay_warped(frame, warped, square_map, H)
             
-            # Show warped view
-            warped = warp_board(frame, H)
-            cv2.putText(warped, f"Pieces: {len(square_map)}", (10, 30),
+            # Draw detections on warped view for debugging
+            warped_display = warped.copy()
+            for square, det in square_map.items():
+                cx, cy = det['center']
+                color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+                cv2.circle(warped_display, (int(cx), int(cy)), 5, color, -1)
+                cv2.putText(warped_display, square, (int(cx) + 10, int(cy)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Draw grid on warped view
+            for i in range(9):
+                # Vertical lines
+                x = i * SQUARE_SIZE
+                cv2.line(warped_display, (x, 0), (x, BOARD_SIZE), (0, 255, 255), 1)
+                # Horizontal lines  
+                y = i * SQUARE_SIZE
+                cv2.line(warped_display, (0, y), (BOARD_SIZE, y), (0, 255, 255), 1)
+            
+            cv2.putText(warped_display, f"Pieces: {len(square_map)}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.imshow("Warped Board", warped)
+            cv2.imshow("Warped Board", warped_display)
             
             # Compare with target if provided
             if args.target_fen:

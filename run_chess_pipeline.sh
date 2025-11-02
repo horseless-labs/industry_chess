@@ -19,4 +19,4 @@ python test_chess_detector.py \
 	--save_video
 
 # Homography
-#python3 chess_homography.py --source data/preliminary_videos/test.mp4 --#model runs/detect/train/weights/best.pt
+python3 chess_homography.py --source data/preliminary_videos/test.mp4 --model runs/detect/train/weights/best.pt
