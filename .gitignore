@@ -9,3 +9,5 @@ wandb/
 yolo_export/
 *yolo*
 *.zip
+
+inference_test_pipeline.sh
