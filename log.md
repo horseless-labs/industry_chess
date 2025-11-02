@@ -51,3 +51,12 @@ The recordings need to be moved, renamed, etc. Right now, we are taking examples
 ## 2158
 TODO: organize video files output from `record_with_homography.py`, JSON files output from LabelStudio, etc.
 TODO: Rewrite where code outputs any files
+TODO: Reconsider the need for rectified versions of videos.
+
+Recorded 26 short baseline videos, some of which include board rotation and piece movement.
+
+# 2025-11-01
+## 1159
+Downloaded a decently sized chess dataset from Roboflow and trained a model on it. Will validate tomorrow
+
+# 2025-11-02
