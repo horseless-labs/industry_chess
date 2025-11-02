@@ -134,3 +134,10 @@ Two notes:
 
 ## 1510
 Fixed the king/queen problem and added some thresholding for black pawn/bishops. TODO: refine later.
+
+## 1642
+*Rough* homography code working.
+1. It hasn't been thoroughly tested, but one thing that jumps out is that the recording angle of the first video was low, and the code can now place one piece in several different squares.
+2. Automatic corner detection is a complete mess; will need to start using manual from go until it's fixed.
+
+Next step: getting a video from a higher angle and with better lighting conditions.

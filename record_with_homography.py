@@ -1,731 +1,833 @@
-# chessboard_rectify_slim_record.py
-# pip install opencv-python numpy
-import cv2 as cv
+#!/usr/bin/env python3
+"""
+Chess board homography + FEN detection and validation.
+
+Usage:
+    # Webcam with auto-selection
+    python chess_homography_fen.py --model best.pt
+    
+    # Specific camera
+    python chess_homography_fen.py --model best.pt --source 0
+    
+    # Video file
+    python chess_homography_fen.py --model best.pt --source game.mp4
+    
+    # With target FEN for validation
+    python chess_homography_fen.py --model best.pt --target-fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+Controls:
+    a = auto-detect board corners
+    m = manual corner selection (click 4 corners: h8, a8, a1, h1)
+    p = pause/unpause
+    r = reset homography
+    q = quit
+"""
+
+import cv2
 import numpy as np
-from collections import deque
-import glob, platform, time, argparse, os
-from datetime import datetime
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
-# ---------- Config ----------
-CANONICAL_SIZE = 512
-BOARD_INNER = (7, 7)
-EDGE_TH = (60, 180)
-MIN_LINE_LEN = 120
-MAX_LINE_GAP = 10
-CONF_HISTORY = 10
-UPDATE_MIN_CONF = 0.35
-SCAN_MAX_INDEX = 10
-SHOW = True
+# --------------------------------------------
+# CONFIG
+# --------------------------------------------
+BOARD_SIZE = 800  # warped board will be 800x800
+SQUARE_SIZE = BOARD_SIZE // 8
 
-# ---------- Globals ----------
-_manual_clicks = []
-_manual_H = None
-_manual_active = False
-_last_mode = "none"
+# Label fixes (if your dataset has king/queen swapped)
+LABEL_FIXES = {
+    'white_king': 'white_queen',
+    'white_queen': 'white_king',
+    'black_king': 'black_queen',
+    'black_queen': 'black_king',
+}
+APPLY_LABEL_FIX = True  # Set to False if your labels are correct
 
-# ---------- Small geometry / image utils ----------
-def to_gray(img):
-    return cv.cvtColor(img, cv.COLOR_BGR2GRAY) if img.ndim == 3 else img
+# Map model class names to FEN piece letters
+CLASS_TO_FEN = {
+    "white_king": "K",
+    "white_queen": "Q",
+    "white_rook": "R",
+    "white_bishop": "B",
+    "white_knight": "N",
+    "white_pawn": "P",
+    "black_king": "k",
+    "black_queen": "q",
+    "black_rook": "r",
+    "black_bishop": "b",
+    "black_knight": "n",
+    "black_pawn": "p",
+}
 
-def order_quad(pts4):
-    pts = np.array(pts4, np.float32)
-    c = pts.mean(0)
-    ang = np.arctan2(pts[:,1]-c[1], pts[:,0]-c[0])
-    pts = pts[np.argsort(ang)]
-    tl = np.argmin(pts.sum(1))
-    return np.roll(pts, -tl, 0)
-
-def poly_area(q):
-    return 0.5 * abs(np.dot(q[:,0], np.roll(q[:,1], -1)) - np.dot(q[:,1], np.roll(q[:,0], -1)))
-
-def shrink_toward_center(q, frac=0.06):
-    q = q.astype(np.float32)
-    c = q.mean(0, keepdims=True)
-    return c + (q - c) * (1.0 - float(frac))
-
-def H_from_quad(q, size=CANONICAL_SIZE):
-    dst = np.float32([[0,0],[size-1,0],[size-1,size-1],[0,size-1]])
-    return cv.getPerspectiveTransform(np.float32(q), dst)
-
-def warp_rectify(frame, H, size=CANONICAL_SIZE):
-    return cv.warpPerspective(frame, H, (size, size))
-
-def avg_luma(img):
-    g = to_gray(img)
-    return float(g.mean())
-
-def orientation_fix(rectified):
-    S = rectified.shape[0]
-    t = S // 8
-    pad = max(2, t//10)
-    a1 = rectified[(7*t)+pad:(8*t)-pad, 0+pad:t-pad]
-    h1 = rectified[(7*t)+pad:(8*t)-pad, (7*t)+pad:(8*t)-pad]
-    if avg_luma(a1) > avg_luma(h1):
-        return cv.rotate(rectified, cv.ROTATE_180)
-    return rectified
-
-def checker_energy(rectified, tiles=8):
-    g = to_gray(rectified)
-    S = g.shape[0]
-    t = S // tiles
-    if t < 4: return 0.0
-    acc, cnt = 0.0, 0
-    for r in range(tiles):
-        for c in range(tiles):
-            y0, y1 = r*t, (r+1)*t
-            x0, x1 = c*t, (c+1)*t
-            m = float(g[y0:y1, x0:x1].mean())
-            acc += (1 if ((r+c) % 2 == 0) else -1) * m
-            cnt += 1
-    return abs(acc) / (cnt + 1e-6)
-
-def crop_to_quad(frame, quad, pad=24, min_area_norm=0.06):
-    if quad is None: return frame, (0,0), False, 1.0
-    h, w = frame.shape[:2]
-    area_norm = poly_area(quad) / (w*h + 1e-6)
-    if area_norm < min_area_norm:
-        return frame, (0,0), False, area_norm
-    x0 = max(int(min(quad[:,0]))-pad, 0)
-    y0 = max(int(min(quad[:,1]))-pad, 0)
-    x1 = min(int(max(quad[:,0]))+pad, w)
-    y1 = min(int(max(quad[:,1]))+pad, h)
-    return frame[y0:y1, x0:x1], (x0,y0), True, area_norm
-
-import os
-
-def _norm_codec_and_path(path, codec):
-    """
-    Normalize (fourcc, path) to avoid bad container/codec combos that trigger warnings or fail.
-    Rules:
-      - .mp4  -> prefer mp4v (MPEG-4 Part 2) since H264 encoder often missing in OpenCV builds
-      - .avi  -> XVID or MJPG are safe and common
-      - no ext -> choose based on codec
-    Returns: (fourcc_str, final_path)
-    """
-    codec = (codec or "").upper()
-    root, ext = os.path.splitext(path if path else "")
-
-    def with_ext(base, wanted_ext):
-        if not base: base = "video"
-        return (base if not base.lower().endswith(wanted_ext) else base)
-
-    # If no path provided, pick a sensible default by codec
-    if not path:
-        if codec in ("XVID", "MJPG"):
-            return codec, "video.avi"
-        elif codec in ("H264", "AVC1", "H265", "HEVC"):
-            # Most OpenCV wheels can't encode these; fall back to mp4v
-            return "mp4v", "video.mp4"
-        else:
-            # Unknown -> mp4v in mp4
-            return "mp4v", "video.mp4"
-
-    # If user gave a path, align FOURCC to extension
-    ext = ext.lower()
-    if ext in (".mp4", ".m4v"):
-        # Use mp4v for maximum write-compat without external encoders
-        if codec in ("MP4V", "M4V", "MPEG4"):
-            return "mp4v", path
-        else:
-            # Map XVID/MJPG/H264 to mp4v silently to prevent warnings
-            return "mp4v", path
-    elif ext == ".avi":
-        # AVI plays nice with XVID or MJPG
-        if codec in ("XVID", "MJPG"):
-            return codec, path
-        # If user asked for H264 in AVI, steer to XVID to keep it working
-        return "XVID", path
-    elif ext == ".mkv":
-        # MKV is flexible; still avoid H264 if encoder missing -> prefer XVID
-        if codec in ("XVID", "MJPG"):
-            return codec, path
-        return "XVID", path
-    else:
-        # Unknown extension: default to mp4/mp4v
-        return "mp4v", root + ".mp4"
-
-# ---------- Manual calibration mouse callback ----------
-def _mouse_cb(event, x, y, flags, userdata):
-    global _manual_clicks, _manual_H, _manual_active
-    if not _manual_active: return
-    if event == cv.EVENT_LBUTTONDOWN:
-        _manual_clicks.append((x,y))
-        if len(_manual_clicks) == 4:
-            q = order_quad(np.array(_manual_clicks, np.float32))
-            _manual_H = H_from_quad(q)
-            _manual_active = False
-            print("Manual calibration captured.")
-
-# ---------- Detectors ----------
-def detect_grid_H(frame):
-    gray = to_gray(frame)
-    gray = cv.createCLAHE(2.0, (8,8)).apply(gray)
-    flags = cv.CALIB_CB_EXHAUSTIVE + cv.CALIB_CB_ACCURACY
-    ok, corners = cv.findChessboardCornersSB(gray, BOARD_INNER, flags=flags)
-    if not ok: return None, 0.0
-    img_pts = corners.reshape(-1,2).astype(np.float32)
-    xs = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[0])
-    ys = np.linspace((0.5/8)*CANONICAL_SIZE, (7.5/8)*CANONICAL_SIZE, BOARD_INNER[1])
-    XX, YY = np.meshgrid(xs, ys)
-    canon_pts = np.stack([XX.ravel(), YY.ravel()], 1).astype(np.float32)
-    H, mask = cv.findHomography(img_pts, canon_pts, cv.RANSAC, 3.0)
-    if H is None or mask is None: return None, 0.0
-    return H, float(mask.sum()) / len(mask)
-
-def detect_outer_quad_contour(frame):
-    work = cv.GaussianBlur(frame, (5,5), 0)
-    gray = cv.createCLAHE(2.0, (8,8)).apply(to_gray(work))
-    th = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                              cv.THRESH_BINARY, 31, 5)
-    th = cv.morphologyEx(th, cv.MORPH_CLOSE, np.ones((5,5), np.uint8), 2)
-    cnts, _ = cv.findContours(th, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None, 0.0
-    h, w = frame.shape[:2]
-    best_q, best_score = None, -1
-    for c in cnts:
-        area = cv.contourArea(c)
-        if area < 0.02 * w * h: continue
-        peri = cv.arcLength(c, True)
-        approx = cv.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4: continue
-        approx = approx.reshape(-1,2).astype(np.float32)
-        if not cv.isContourConvex(approx.astype(np.int32)): continue
-        rw, rh = cv.minAreaRect(approx)[1]
-        if rw < 1 or rh < 1: continue
-        squareness = min(rw, rh) / max(rw, rh)
-        score = 0.8 * (area / (w*h+1e-6)) + 0.2 * squareness
-        if score > best_score:
-            best_q, best_score = order_quad(approx), score
-    if best_q is None: return None, 0.0
-    area_norm = poly_area(best_q) / (w*h + 1e-6)
-    conf = 0.6 * area_norm + 0.4 * best_score
-    return best_q, float(conf)
-
-def detect_outer_quad_hough(frame):
-    gray = to_gray(cv.GaussianBlur(frame, (5,5), 0))
-    edges = cv.Canny(gray, EDGE_TH[0], EDGE_TH[1])
-    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=120,
-                           minLineLength=MIN_LINE_LEN, maxLineGap=MAX_LINE_GAP)
-    if lines is None: return None, 0.0
-    horiz, vert = [], []
-    for x1,y1,x2,y2 in lines[:,0,:]:
-        ang = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
-        if ang < 20 or ang > 160: horiz.append([x1,y1,x2,y2])
-        elif 70 < ang < 110:      vert.append([x1,y1,x2,y2])
-    if len(horiz) < 2 or len(vert) < 2: return None, 0.0
-    horiz, vert = np.array(horiz), np.array(vert)
-    def mids(L): return (L[:,0:2] + L[:,2:4]) / 2.0
-    hm, vm = mids(horiz), mids(vert)
-    top    = horiz[np.argmin(hm[:,1])]
-    bottom = horiz[np.argmax(hm[:,1])]
-    left   = vert [np.argmin(vm[:,0])]
-    right  = vert [np.argmax(vm[:,0])]
-    def params(l): x1,y1,x2,y2=l; A=y2-y1; B=x1-x2; C=A*x1+B*y1; return A,B,C
-    def inter(l1,l2):
-        A1,B1,C1 = params(l1); A2,B2,C2 = params(l2)
-        det = A1*B2 - A2*B1
-        if abs(det) < 1e-6: return None
-        x = (B2*C1 - B1*C2)/det; y = (A1*C2 - A2*C1)/det
-        return np.array([x,y], np.float32)
-    pts = [inter(top,left), inter(top,right), inter(bottom,right), inter(bottom,left)]
-    if any(p is None for p in pts): return None, 0.0
-    q = order_quad(pts)
-    h,w = frame.shape[:2]
-    area_norm = poly_area(q) / (w*h + 1e-6)
-    v1, v2 = q[1]-q[0], q[3]-q[0]
-    cosang = abs(np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2)+1e-6))
-    ortho = 1 - cosang
-    conf = 0.5*area_norm + 0.5*max(0.0, ortho)
-    return q, float(conf)
-
-def detect_blue_tape_quad(frame):
-    hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-    mask = cv.inRange(hsv, np.array([90,60,40], np.uint8), np.array([135,255,255], np.uint8))
-    k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7,7))
-    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, k, 2)
-    mask = cv.morphologyEx(mask, cv.MORPH_OPEN,  k, 1)
-    cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None, 0.0
-    h, w = frame.shape[:2]
-    best = max(cnts, key=cv.contourArea)
-    area = cv.contourArea(best)
-    if area < 0.02 * w * h: return None, 0.0
-    rect = cv.minAreaRect(best)
-    quad = order_quad(cv.boxPoints(rect).astype(np.float32))
-    candidates = [shrink_toward_center(quad, f) for f in (0.04, 0.06, 0.08)]
-    best_q, best_s = None, -1.0
-    for q in candidates:
-        Hq = H_from_quad(q)
-        rectified = warp_rectify(frame, Hq)
-        s = checker_energy(rectified)
-        if s > best_s:
-            best_s, best_q = s, q
-    conf = 0.5 * (area/(w*h+1e-6)) + 0.5 * min(best_s/40.0, 1.0)
-    return best_q, float(conf)
-
-# ---------- Tracking ----------
-class BoardTracker:
-    def __init__(self):
-        self.img_pts = None
-        self.canon_pts = None
-        self.prev_gray = None
-        self.failed = 0
-
-    def seed(self, H, size=CANONICAL_SIZE, inner=BOARD_INNER):
-        xs = np.linspace((0.5/8)*size, (7.5/8)*size, inner[0], dtype=np.float32)
-        ys = np.linspace((0.5/8)*size, (7.5/8)*size, inner[1], dtype=np.float32)
-        XX, YY = np.meshgrid(xs, ys)
-        canon = np.stack([XX.ravel(), YY.ravel()], 1).astype(np.float32)
-        Hinv = np.linalg.inv(H)
-        pts3 = np.hstack([canon, np.ones((canon.shape[0],1), np.float32)])
-        proj = (Hinv @ pts3.T).T
-        proj = (proj[:,:2] / proj[:,2:3]).astype(np.float32)
-        self.img_pts, self.canon_pts = proj, canon
-        self.prev_gray, self.failed = None, 0
-
-    def estimate_quad_from(self, H):
-        canon_corners = np.float32([[0,0],[CANONICAL_SIZE-1,0],[CANONICAL_SIZE-1,CANONICAL_SIZE-1],[0,CANONICAL_SIZE-1]])
-        Hinv = np.linalg.inv(H)
-        pts3 = np.hstack([canon_corners, np.ones((4,1), np.float32)])
-        proj = (Hinv @ pts3.T).T
-        return order_quad((proj[:,:2] / proj[:,2:3]).astype(np.float32))
-
-    def step(self, frame_bgr):
-        if self.img_pts is None: return None, 0.0
-        gray = to_gray(frame_bgr)
-        if self.prev_gray is None:
-            self.prev_gray = gray
-            return None, 0.0
-        next_pts, st, err = cv.calcOpticalFlowPyrLK(
-            self.prev_gray, gray, self.img_pts.reshape(-1,1,2),
-            None, winSize=(21,21), maxLevel=3,
-            criteria=(cv.TERM_CRITERIA_EPS|cv.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
-        self.prev_gray = gray
-        if next_pts is None or st is None:
-            self.failed += 1; return None, 0.0
-        st = st.reshape(-1).astype(bool)
-        img_t = next_pts.reshape(-1,2)[st]
-        can_t = self.canon_pts[st]
-        if len(img_t) < 12:
-            self.failed += 1; return None, 0.0
-        H, mask = cv.findHomography(img_t, can_t, cv.RANSAC, 3.0)
-        if H is None or mask is None:
-            self.failed += 1; return None, 0.0
-        inl = mask.reshape(-1).astype(bool)
-        self.img_pts, self.canon_pts = img_t[inl], can_t[inl]
-        self.failed = 0
-        return H, float(inl.sum()) / len(inl)
-
-# ---------- Keeper ----------
-class HomographyKeeper:
-    def __init__(self):
-        self.H = None
-        self.conf_hist = deque(maxlen=CONF_HISTORY)
-        self.tracker = BoardTracker()
-        self.weak = 0
-    def update(self, H, conf):
-        if H is None: return False
-        self.conf_hist.append(conf)
-        if conf >= UPDATE_MIN_CONF or (self.H is None and conf > 0):
-            self.H = H
-            return True
-        return False
-    def reset(self):
-        self.H = None
-        self.tracker = BoardTracker()
-        self.weak = 0
-
-# ---------- Unified rectification ----------
-def rectify_frame(frame, keeper):
-    global _manual_H, _last_mode
-    if _manual_H is not None:
-        keeper.update(_manual_H, 1.0)
-        rect = orientation_fix(warp_rectify(frame, keeper.H))
-        _last_mode = "manual"
-        return rect, 1.0, (1.0, 0.0), None
-
-    quad_tape, conf_tape = detect_blue_tape_quad(frame)
-    if quad_tape is not None and conf_tape >= 0.35:
-        Ht = H_from_quad(quad_tape)
-        keeper.update(Ht, conf_tape)
-        if keeper.tracker.canon_pts is None:
-            keeper.tracker.seed(Ht)
-        rect = orientation_fix(warp_rectify(frame, Ht))
-        _last_mode = "tape"
-        return rect, conf_tape, (0.0, conf_tape), quad_tape
-
-    Hpred, rtrack = (None, 0.0)
-    quad_est = None
-    if keeper.H is not None:
-        Ht, r = keeper.tracker.step(frame)
-        if Ht is not None and r >= 0.4:
-            Hpred, rtrack = Ht, r
-        quad_est = shrink_toward_center(keeper.tracker.estimate_quad_from(keeper.H), 0.03)
-
-    search, off, used_roi, _ = (frame, (0,0), False, 0.0)
-    if quad_est is not None:
-        pad = 40 if rtrack < 0.6 else 28
-        search, off, used_roi, _ = crop_to_quad(frame, quad_est, pad=pad)
-
-    H, rgrid = (None, 0.0)
-    if Hpred is None:
-        Hg, rg = detect_grid_H(search)
-        if Hg is not None:
-            T = np.array([[1,0,-off[0]],[0,1,-off[1]],[0,0,1]], np.float32)
-            H, rgrid = Hg @ T, float(rg)
-
-    quad, rhough = (None, 0.0)
-    if (H is None) or (rgrid < 0.5 and rtrack < 0.5):
-        qh, ch = detect_outer_quad_hough(search)
-        qc, cc = detect_outer_quad_contour(search)
-        def area_norm(q):
-            if q is None: return 0.0
-            h,w = frame.shape[:2]
-            return poly_area(q)/(h*w+1e-6)
-        cand = max(((qh,ch),(qc,cc)), key=lambda qc: area_norm(qc[0]))
-        quad, rhough = cand
-        if quad is not None:
-            quad = quad + np.array(off, np.float32)
-            tests = [quad] + ([shrink_toward_center(quad, f) for f in (0.04,0.06,0.08)] if area_norm(quad) > 0.30 else [])
-            best_q, best_s = None, -1.0
-            for q in tests:
-                Hq = H_from_quad(q)
-                s = checker_energy(warp_rectify(frame, Hq))
-                if s > best_s:
-                    best_q, best_s = q, s
-            quad = best_q
-            H = H_from_quad(quad)
-
-    conf = max(rtrack, rgrid, rhough)
-    keeper.weak = (keeper.weak + 1) if conf < 0.35 else 0
-    if keeper.weak >= 10:
-        keeper.reset()
-        _last_mode = "reset"
-        return None, conf, (rgrid, rhough), None
-
-    keeper.update(H, conf)
-    if keeper.H is None:
-        _last_mode = "none"
-        return None, conf, (rgrid, rhough), None
-
-    if conf >= 0.55 and (keeper.tracker.canon_pts is None or len(keeper.tracker.canon_pts) < 20 or keeper.tracker.failed):
-        keeper.tracker.seed(keeper.H)
-
-    rectified = orientation_fix(warp_rectify(frame, keeper.H))
-    _last_mode = "grid" if rgrid >= rhough else "hough"
-    return rectified, conf, (rgrid, rhough), quad
-
-# ---------- Camera helpers ----------
-import os, glob
-
-def list_cameras():
-    """
-    Prefer stable /dev/v4l/by-id symlinks; fall back to /dev/videoN.
-    Returns a list of dicts: {key,label,open_arg,api,stable_id}
-    """
-    cams, key = [], 0
-
-    # Prefer stable symlinks (Linux)
-    by_id = sorted(glob.glob('/dev/v4l/by-id/*'))
-    for p in by_id:
-        try:
-            real = os.path.realpath(p)   # e.g. /dev/video4
-            label = f"{os.path.basename(p)} -> {os.path.basename(real)}"
-            cams.append({
-                'key': str(key),
-                'label': label,
-                'open_arg': p,            # open via stable symlink
-                'api': cv.CAP_V4L2,
-                'stable_id': os.path.basename(p),
-            })
-            key += 1
-        except Exception:
-            pass
-
-    # Fallback: volatile /dev/videoN
-    for path in sorted(glob.glob('/dev/video*')):
-        cams.append({
-            'key': str(key),
-            'label': f"{path} (V4L2)",
-            'open_arg': path,
-            'api': cv.CAP_V4L2,
-            'stable_id': None,
-        })
-        key += 1
-
-    # As an absolute last fallback, try numeric indices 0..5 (non-Linux or exotic)
-    if not cams:
-        for idx in range(6):
-            cams.append({
-                'key': str(key),
-                'label': f"Device Index {idx}",
-                'open_arg': idx,
-                'api': None,
-                'stable_id': None,
-            })
-            key += 1
+# --------------------------------------------
+# CAMERA / SOURCE
+# --------------------------------------------
+def list_cameras(max_index=10):
+    """Find available cameras."""
+    cams = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        if cap is not None and cap.isOpened():
+            cams.append(i)
+            cap.release()
     return cams
 
-def _open_camera(open_arg, api_pref):
-    cap = cv.VideoCapture(open_arg, api_pref) if api_pref else cv.VideoCapture(open_arg)
-    if not cap.isOpened():
-        print("Error: Could not open camera.")
-        return None
-    try:
-        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv.CAP_PROP_FRAME_HEIGHT, 1080)
-        cap.set(cv.CAP_PROP_FPS, 30)
-        cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
-    except Exception as e:
-        print("Warning: failed to set some camera properties:", e)
-    print(f"Camera opened at {int(cap.get(cv.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))} @ {cap.get(cv.CAP_PROP_FPS):.1f} FPS")
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        print("Error: failed to read initial frame.")
-        cap.release()
-        return None
-    return cap
 
-
-def select_camera_interactive():
-    while True:
+def open_source(source):
+    """Open camera or video file."""
+    if source is None:
         cams = list_cameras()
-        print("\n=== Select a Camera ===")
+        if not cams:
+            print("No webcams found. Provide a video file with --source /path/to/video.mp4")
+            sys.exit(1)
+        print("Available cameras:")
         for c in cams:
-            print(f"[{c['key']}] {c['label']}")
-        print("\n[r] Refresh   [q] Quit")
-        choice = input("Enter selection: ").strip().lower()
-        if choice == 'q':
-            return None, None, None
-        if choice == 'r':
-            continue
-        sel = next((c for c in cams if c['key'] == choice), None)
-        if not sel:
-            print("Invalid selection."); continue
-        cap = _open_camera(sel['open_arg'], sel['api'])
-        if cap is None:
-            print("Open failed."); continue
-        print(f"Opened: {sel['label']}")
-        return cap, sel['label'], (sel['open_arg'], sel['api'], sel.get('stable_id'))
-
-
-# ---------- Video recording helpers ----------
-def make_timestamped(base, ext):
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    root = os.path.splitext(base)[0]
-    return f"{root}_{stamp}{ext}"
-
-def create_writer(path, size, fps, fourcc_str="MJPG"):
-    fourcc_str, path = _norm_codec_and_path(path, fourcc_str)
-    fourcc = cv.VideoWriter_fourcc(*fourcc_str)
-    writer = cv.VideoWriter(path, fourcc, fps, size)
-    if not writer.isOpened():
-        print(f"[REC] ERROR: Could not open writer for {path} with FOURCC {fourcc_str}")
+            print(f"  [{c}]")
+        idx = int(input("Select camera index: ").strip())
+        cap = cv2.VideoCapture(idx)
+        return cap
     else:
-        print(f"[REC] Using container for {os.path.splitext(path)[1].lower()} with FOURCC {fourcc_str}")
-    return writer, path
+        # Try int first
+        try:
+            idx = int(source)
+            cap = cv2.VideoCapture(idx)
+            return cap
+        except ValueError:
+            # Assume file
+            p = Path(source)
+            if not p.exists():
+                print(f"Source file not found: {p}")
+                sys.exit(1)
+            cap = cv2.VideoCapture(str(p))
+            return cap
 
 
-class DualRecorder:
-    def __init__(self, orig_path=None, rect_path=None, fps=30, codec="MJPG"):
-        self.codec = codec
-        self.fps = fps
-        self.orig_path = orig_path
-        self.rect_path = rect_path
-        self.orig_writer = None
-        self.rect_writer = None
-        self.enabled = False
-        self._sizes_ready = False
-        self._orig_size = None  # (w,h)
-        self._rect_size = (CANONICAL_SIZE, CANONICAL_SIZE)
-
-    def ensure_open(self, frame_bgr):
-        if not self.enabled: return
-        if not self._sizes_ready:
-            h, w = frame_bgr.shape[:2]
-            self._orig_size = (w, h)
-            self._sizes_ready = True
-        if self.orig_writer is None:
-            path = self.orig_path or make_timestamped("orig.mp4", ".mp4")
-            self.orig_writer, final_path = create_writer(path, self._orig_size, self.fps, self.codec)
-            print(f"[REC] Writing original to {final_path} @ {self._orig_size} {self.fps}fps")
-
-        if self.rect_writer is None:
-            path = self.rect_path or make_timestamped("rect.mp4", ".mp4")
-            self.rect_writer, final_path = create_writer(path, self._rect_size, self.fps, self.codec)
-            print(f"[REC] Writing rectified to {final_path} @ {self._rect_size} {self.fps}fps")
-
-    def write(self, frame_bgr, rectified_bgr):
-        if not self.enabled: return
-        if frame_bgr is None: return
-        self.ensure_open(frame_bgr)
-        if self.orig_writer: self.orig_writer.write(frame_bgr)
-        if rectified_bgr is not None and self.rect_writer:
-            # Ensure rectified matches writer size
-            if rectified_bgr.shape[1] != self._rect_size[0] or rectified_bgr.shape[0] != self._rect_size[1]:
-                rectified_bgr = cv.resize(rectified_bgr, self._rect_size)
-            self.rect_writer.write(rectified_bgr)
-
-    def toggle(self):
-        self.enabled = not self.enabled
-        print(f"[REC] {'Started' if self.enabled else 'Stopped'} recording.")
-        if not self.enabled:
-            self.release()
-
-    def release(self):
-        if self.orig_writer:
-            self.orig_writer.release()
-            self.orig_writer = None
-        if self.rect_writer:
-            self.rect_writer.release()
-            self.rect_writer = None
-
-def _reopen_camera_or_rescan(open_pack, recorder):
+# --------------------------------------------
+# BOARD DETECTION (AUTO)
+# --------------------------------------------
+def detect_board_corners_auto(frame):
     """
-    Try to reopen the same camera. If it no longer exists (errno 19),
-    rescan /dev/v4l/by-id to find a device with the same stable_id.
-    Returns (cap, new_open_pack or None). Either may be None on failure.
+    Try to find chessboard using contour detection.
+    Returns corners as [h8, a8, a1, h1] or None.
     """
-    if open_pack is None:
-        return None, None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    
+    # Dilate to connect edges
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    
+    # Sort by area
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    for cnt in contours[:5]:  # Check top 5 largest
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        
+        if len(approx) == 4:
+            # Check if it's roughly square-shaped
+            pts = approx.reshape(4, 2).astype(np.float32)
+            ordered = order_points(pts)
+            
+            # Calculate aspect ratio
+            w1 = np.linalg.norm(ordered[0] - ordered[1])
+            w2 = np.linalg.norm(ordered[2] - ordered[3])
+            h1 = np.linalg.norm(ordered[0] - ordered[3])
+            h2 = np.linalg.norm(ordered[1] - ordered[2])
+            
+            aspect_ratio = max(w1, w2) / max(h1, h2)
+            
+            # Should be roughly square (0.7 to 1.3 ratio)
+            if 0.7 < aspect_ratio < 1.3:
+                return ordered
+    
+    return None
 
-    # Pause recording while device is down (avoids writing black frames)
-    if recorder and recorder.enabled:
-        print("[REC] Pausing due to camera failure...")
-        recorder.toggle()  # stops & releases writers
 
-    prev_open_arg, prev_api, prev_stable = open_pack
+# --------------------------------------------
+# MANUAL CORNER SELECTION
+# --------------------------------------------
+manual_points = []
 
-    # 1) Try the same open_arg first
-    cap = _open_camera(prev_open_arg, prev_api)
-    if cap is not None:
-        print("Reconnected (same path).")
-        return cap, open_pack
-
-    # 2) If we had a stable_id, try to find it again in by-id
-    if prev_stable:
-        cams = list_cameras()
-        match = next((c for c in cams if c.get('stable_id') == prev_stable), None)
-        if match:
-            cap = _open_camera(match['open_arg'], match['api'])
-            if cap is not None:
-                print(f"Reconnected via by-id: {match['label']}")
-                return cap, (match['open_arg'], match['api'], match['stable_id'])
-
-    print("Reopen failed; will retry...")
-    return None, open_pack
+def mouse_callback(event, x, y, flags, param):
+    """Mouse callback for manual corner selection."""
+    global manual_points
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(manual_points) < 4:
+            manual_points.append((x, y))
+            print(f"Point {len(manual_points)}/4: ({x}, {y})")
 
 
-# ---------- UI / loop ----------
-def draw_debug(frame, rectified, confs, quad, rec_on=False):
-    vis = frame.copy()
-    rgrid, rhough = confs
-    if quad is not None:
-        cv.polylines(vis, [quad.astype(int)], True, (0,255,0), 2)
-    status = f"grid:{rgrid:.2f}  hough:{rhough:.2f}  mode:{_last_mode}"
-    if rec_on: status += "  [REC]"
-    cv.putText(vis, status, (10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv.LINE_AA)
-    if rectified is not None:
-        t = CANONICAL_SIZE // 8
-        for i in range(9):
-            cv.line(rectified, (0, i*t), (CANONICAL_SIZE, i*t), (128,128,128), 1)
-            cv.line(rectified, (i*t, 0), (i*t, CANONICAL_SIZE), (128,128,128), 1)
-    return vis, rectified
-
-def run_loop(cap, cam_label, open_pack, recorder):
-    global _manual_clicks, _manual_H, _manual_active
-    win = "Board Rectification"
-    cv.namedWindow(win, cv.WINDOW_NORMAL)
-    cv.setMouseCallback(win, _mouse_cb)
-    print("Press 'r' to start/stop recording (both streams).")
-    print("Press 'c' to click 4 corners (TL→TR→BR→BL). ESC/q quits.")
-
-    keeper = HomographyKeeper()
-    consecutive_fail, reopen_delay = 0, 0.5
-
+def get_manual_corners(frame):
+    """
+    Let user click 4 corners in order: h8 (top-left), a8 (top-right), 
+    a1 (bottom-right), h1 (bottom-left).
+    Returns ordered corners or None.
+    """
+    global manual_points
+    manual_points = []
+    temp = frame.copy()
+    
+    window_name = "Click 4 corners: h8, a8, a1, h1 (ESC to cancel)"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    labels = ["h8 (top-left)", "a8 (top-right)", "a1 (bottom-right)", "h1 (bottom-left)"]
+    
     while True:
-        # If we currently have no camera, sleep and attempt reopen soon
-        if cap is None:
-            time.sleep(0.25)
-            cap, open_pack = _reopen_camera_or_rescan(open_pack, recorder)
-            blank = np.zeros((480, 640, 3), np.uint8)
-            cv.putText(blank, "Camera not available... trying to reconnect",
-                       (20, 240), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
-            cv.imshow(win, blank)
-            if (cv.waitKey(1) & 0xFF) in (27, ord('q')):
-                break
-            continue
-
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            consecutive_fail += 1
-            print("Camera read failed.")
-            if consecutive_fail >= 3:
-                print("Attempting to reopen camera...")
-                try: cap.release()
-                except Exception: pass
-                cap = None
-                cap, open_pack = _reopen_camera_or_rescan(open_pack, recorder)
-                consecutive_fail = 0
-                reopen_delay = min(reopen_delay * 1.5, 2.0)
-            if (cv.waitKey(1) & 0xFF) in (27, ord('q')):
-                break
-            continue
-
-        consecutive_fail = 0
-        rectified, conf, confs, quad = rectify_frame(frame, keeper)
-
-        # --- recording ---
-        recorder.write(frame, rectified)
-
-        if SHOW:
-            vis, rect = draw_debug(frame, None if rectified is None else rectified.copy(), confs, quad, rec_on=recorder.enabled)
-            if rect is not None:
-                side = CANONICAL_SIZE
-                h = max(vis.shape[0], side)
-                canvas = np.zeros((h, vis.shape[1]+side, 3), dtype=np.uint8)
-                canvas[:vis.shape[0], :vis.shape[1]] = vis
-                canvas[:side, vis.shape[1]:vis.shape[1]+side] = rect
-                cv.putText(canvas, cam_label, (10, h-10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
-                cv.imshow(win, canvas)
-            else:
-                cv.putText(vis, cam_label, (10, vis.shape[0]-10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
-                cv.imshow(win, vis)
-
-        key = cv.waitKey(1) & 0xFF
-        if key in (27, ord('q')):
+        disp = temp.copy()
+        
+        # Draw existing points
+        for i, p in enumerate(manual_points):
+            color = (0, 255, 0) if i < 4 else (0, 0, 255)
+            cv2.circle(disp, p, 5, color, -1)
+            cv2.putText(disp, labels[i], (p[0] + 10, p[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Show instruction
+        next_label = labels[len(manual_points)] if len(manual_points) < 4 else "Done"
+        cv2.putText(disp, f"Click: {next_label}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        cv2.imshow(window_name, disp)
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == 27:  # ESC
+            print("Manual selection canceled")
             break
-        if key == ord('c'):
-            _manual_clicks, _manual_H, _manual_active = [], None, True
-            print("Manual calibration: click 4 board corners clockwise from top-left.")
-        if key == ord('r'):
-            recorder.toggle()
+        if len(manual_points) == 4:
+            print("All 4 corners selected")
+            break
+    
+    cv2.destroyWindow(window_name)
+    
+    if len(manual_points) != 4:
+        return None
+    
+    # Return as h8, a8, a1, h1 (already in correct order)
+    return np.array(manual_points, dtype=np.float32)
 
-    recorder.release()
 
-# ---------- Main ----------
-def parse_args():
-    ap = argparse.ArgumentParser(description="Chessboard rectification with dual recording")
-    ap.add_argument("--orig", type=str, default=None, help="Output path for original video (e.g., orig.avi)")
-    ap.add_argument("--rect", type=str, default=None, help="Output path for rectified video (e.g., rect.avi)")
-    ap.add_argument("--fps", type=int, default=30, help="Recording FPS")
-    ap.add_argument("--codec", type=str, default="XVID", help="FOURCC codec (e.g., XVID, MJPG, H264)")
-    return ap.parse_args()
+# --------------------------------------------
+# HOMOGRAPHY / WARP
+# --------------------------------------------
+def order_points(pts):
+    """
+    Order points as: TL, TR, BR, BL.
+    This will be mapped to: h8, a8, a1, h1
+    """
+    rect = np.zeros((4, 2), dtype="float32")
+    
+    # Sum and diff
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+    
+    rect[0] = pts[np.argmin(s)]      # Top-left (smallest sum)
+    rect[2] = pts[np.argmax(s)]      # Bottom-right (largest sum)
+    rect[1] = pts[np.argmin(diff)]   # Top-right (smallest diff)
+    rect[3] = pts[np.argmax(diff)]   # Bottom-left (largest diff)
+    
+    return rect
 
-def main():
-    args = parse_args()
-    cap, label, pack = select_camera_interactive()
-    if cap is None:
-        print("No camera selected. Exiting."); return
-    recorder = DualRecorder(orig_path=args.orig, rect_path=args.rect, fps=args.fps, codec=args.codec)
+
+def compute_homography(src_corners):
+    """
+    Compute homography from source corners to canonical board.
+    src_corners should be [h8, a8, a1, h1]
+    """
+    # Destination: canonical 800x800 board
+    # h8 at (0,0), a8 at (800,0), a1 at (800,800), h1 at (0,800)
+    dst_corners = np.array([
+        [0, 0],                      # h8
+        [BOARD_SIZE, 0],             # a8
+        [BOARD_SIZE, BOARD_SIZE],    # a1
+        [0, BOARD_SIZE]              # h1
+    ], dtype=np.float32)
+    
+    H, _ = cv2.findHomography(src_corners, dst_corners)
+    return H
+
+
+def warp_board(frame, H):
+    """Warp the board to canonical view."""
+    warped = cv2.warpPerspective(frame, H, (BOARD_SIZE, BOARD_SIZE))
+    return warped
+
+
+# --------------------------------------------
+# YOLO DETECTION
+# --------------------------------------------
+def load_yolo_model(model_path):
+    """Load YOLO model."""
     try:
-        run_loop(cap, label, pack, recorder)
-    finally:
-        recorder.release()
-        cap.release()
-        cv.destroyAllWindows()
+        from ultralytics import YOLO
+    except ImportError:
+        print("Install ultralytics: pip install ultralytics")
+        sys.exit(1)
+    
+    model = YOLO(model_path)
+    return model
+
+
+def detect_pieces(model, frame, conf_threshold=0.3):
+    """
+    Run YOLO detection on frame.
+    Returns list of detections with bbox in frame coordinates.
+    """
+    results = model.predict(source=frame, conf=conf_threshold, verbose=False)
+    
+    detections = []
+    if not results:
+        return detections
+    
+    r = results[0]
+    if r.boxes is None:
+        return detections
+    
+    for box in r.boxes:
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        cls_name = r.names[cls_id]
+        
+        # Apply label fix if enabled
+        if APPLY_LABEL_FIX:
+            cls_name = LABEL_FIXES.get(cls_name, cls_name)
+        
+        detections.append({
+            "class": cls_name,
+            "confidence": conf,
+            "bbox": [x1, y1, x2, y2],
+            "center": [(x1 + x2) / 2, (y1 + y2) / 2]
+        })
+    
+    return detections
+
+
+# --------------------------------------------
+# MAPPING TO SQUARES
+# --------------------------------------------
+def point_to_square(x, y):
+    """
+    Convert warped board coordinates to chess square.
+    (0, 0) = h8
+    (800, 0) = a8
+    (800, 800) = a1
+    (0, 800) = h1
+    
+    Returns square name like "e4" or None if out of bounds.
+    """
+    if x < 0 or x >= BOARD_SIZE or y < 0 or y >= BOARD_SIZE:
+        return None
+    
+    # Calculate file (a-h) and rank (1-8)
+    file_idx = int(x // SQUARE_SIZE)  # 0=h, 7=a
+    rank_idx = int(y // SQUARE_SIZE)  # 0=8, 7=1
+    
+    file_char = chr(ord('h') - file_idx)  # h, g, f, ..., a
+    rank_num = 8 - rank_idx               # 8, 7, 6, ..., 1
+    
+    return f"{file_char}{rank_num}"
+
+
+def assign_detections_to_warped(detections, use_bottom=True, nms_threshold=0.3):
+    """
+    Map detections (already in warped board space) directly to squares.
+    
+    Args:
+        detections: List of detection dicts
+        use_bottom: If True, use bottom-center of bbox instead of center
+                   (better for tall pieces viewed from low angles)
+        nms_threshold: IoU threshold for non-maximum suppression
+    
+    Returns dict: {square_name: detection}
+    """
+    # First, apply NMS to remove duplicate detections of same piece
+    detections = non_maximum_suppression(detections, nms_threshold)
+    
+    square_map = {}
+    
+    for det in detections:
+        if use_bottom:
+            # Use bottom-center of bounding box (where piece base is)
+            x1, y1, x2, y2 = det["bbox"]
+            cx = (x1 + x2) / 2
+            cy = y2  # Bottom of box (piece base)
+        else:
+            cx, cy = det["center"]
+        
+        square = point_to_square(cx, cy)
+        
+        if square is None:
+            continue
+        
+        # If multiple pieces map to same square, keep highest confidence
+        if square not in square_map or det["confidence"] > square_map[square]["confidence"]:
+            square_map[square] = det
+    
+    return square_map
+
+
+def compute_iou(box1, box2):
+    """Compute IoU between two bounding boxes [x1, y1, x2, y2]."""
+    x1_inter = max(box1[0], box2[0])
+    y1_inter = max(box1[1], box2[1])
+    x2_inter = min(box1[2], box2[2])
+    y2_inter = min(box1[3], box2[3])
+    
+    if x2_inter < x1_inter or y2_inter < y1_inter:
+        return 0.0
+    
+    inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+    
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def non_maximum_suppression(detections, iou_threshold=0.5):
+    """
+    Apply NMS to remove duplicate detections of the same piece.
+    Keeps detection with highest confidence when IoU > threshold.
+    """
+    if len(detections) <= 1:
+        return detections
+    
+    # Sort by confidence (highest first)
+    sorted_dets = sorted(detections, key=lambda d: d["confidence"], reverse=True)
+    
+    keep = []
+    
+    while sorted_dets:
+        # Keep highest confidence detection
+        best = sorted_dets.pop(0)
+        keep.append(best)
+        
+        # Remove detections that overlap significantly with best
+        filtered = []
+        for det in sorted_dets:
+            iou = compute_iou(best["bbox"], det["bbox"])
+            if iou < iou_threshold:
+                filtered.append(det)
+        
+        sorted_dets = filtered
+    
+    return keep
+
+
+def assign_detections_to_squares(detections, H):
+    """
+    Map detections from frame space to board squares using homography.
+    Returns dict: {square_name: detection}
+    (DEPRECATED: Use assign_detections_to_warped when detecting on warped image)
+    """
+    square_map = {}
+    
+    for det in detections:
+        cx, cy = det["center"]
+        
+        # Transform center point through homography
+        pt = np.array([[[cx, cy]]], dtype=np.float32)
+        warped_pt = cv2.perspectiveTransform(pt, H)[0][0]
+        
+        wx, wy = warped_pt
+        square = point_to_square(wx, wy)
+        
+        if square is None:
+            continue
+        
+        # If multiple pieces map to same square, keep highest confidence
+        if square not in square_map or det["confidence"] > square_map[square]["confidence"]:
+            square_map[square] = det
+    
+    return square_map
+
+
+# --------------------------------------------
+# FEN GENERATION
+# --------------------------------------------
+def square_map_to_fen(square_map):
+    """
+    Convert square mapping to FEN notation.
+    Returns full FEN string.
+    """
+    # Build 8x8 board (rank 8 to rank 1)
+    board = [['' for _ in range(8)] for _ in range(8)]
+    
+    for square, det in square_map.items():
+        file_char = square[0]
+        rank_num = int(square[1])
+        
+        file_idx = ord(file_char) - ord('a')  # 0=a, 7=h
+        rank_idx = 8 - rank_num               # 0=rank 8, 7=rank 1
+        
+        cls_name = det["class"]
+        piece_char = CLASS_TO_FEN.get(cls_name, '')
+        
+        if piece_char:
+            board[rank_idx][file_idx] = piece_char
+    
+    # Convert to FEN
+    fen_rows = []
+    for rank in range(8):
+        row_fen = ""
+        empty_count = 0
+        
+        for file_idx in range(8):
+            if board[rank][file_idx] == '':
+                empty_count += 1
+            else:
+                if empty_count > 0:
+                    row_fen += str(empty_count)
+                    empty_count = 0
+                row_fen += board[rank][file_idx]
+        
+        if empty_count > 0:
+            row_fen += str(empty_count)
+        
+        fen_rows.append(row_fen)
+    
+    placement = '/'.join(fen_rows)
+    
+    # Add standard suffixes (can be customized)
+    return f"{placement} w KQkq - 0 1"
+
+
+# --------------------------------------------
+# FEN COMPARISON
+# --------------------------------------------
+def compare_fen(detected_fen, target_fen):
+    """
+    Compare two FEN strings (placement part only).
+    Returns list of differences.
+    """
+    def expand_fen_row(row):
+        """Expand FEN row to 8 characters."""
+        result = []
+        for ch in row:
+            if ch.isdigit():
+                result.extend([''] * int(ch))
+            else:
+                result.append(ch)
+        return result + [''] * (8 - len(result))
+    
+    detected_rows = detected_fen.split()[0].split('/')
+    target_rows = target_fen.split()[0].split('/')
+    
+    differences = []
+    
+    for rank_idx, (det_row, tgt_row) in enumerate(zip(detected_rows, target_rows)):
+        det_expanded = expand_fen_row(det_row)
+        tgt_expanded = expand_fen_row(tgt_row)
+        
+        rank_num = 8 - rank_idx
+        
+        for file_idx, (det_piece, tgt_piece) in enumerate(zip(det_expanded, tgt_expanded)):
+            if det_piece != tgt_piece:
+                file_char = chr(ord('a') + file_idx)
+                square = f"{file_char}{rank_num}"
+                differences.append({
+                    "square": square,
+                    "detected": det_piece or '(empty)',
+                    "expected": tgt_piece or '(empty)'
+                })
+    
+    return differences
+
+
+# --------------------------------------------
+# VISUALIZATION
+# --------------------------------------------
+def draw_board_overlay_warped(frame, warped, square_map, H):
+    """Draw detected pieces from warped space back onto original frame."""
+    overlay = frame.copy()
+    H_inv = np.linalg.inv(H)
+    
+    # Draw board outline
+    corners = np.array([
+        [0, 0],
+        [BOARD_SIZE, 0],
+        [BOARD_SIZE, BOARD_SIZE],
+        [0, BOARD_SIZE]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    
+    frame_corners = cv2.perspectiveTransform(corners, H_inv).astype(np.int32)
+    cv2.polylines(overlay, [frame_corners], True, (0, 255, 0), 3)
+    
+    # Draw grid
+    for i in range(1, 8):
+        # Vertical lines
+        line_start = np.array([[[i * SQUARE_SIZE, 0]]], dtype=np.float32)
+        line_end = np.array([[[i * SQUARE_SIZE, BOARD_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+        
+        # Horizontal lines
+        line_start = np.array([[[0, i * SQUARE_SIZE]]], dtype=np.float32)
+        line_end = np.array([[[BOARD_SIZE, i * SQUARE_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+    
+    # Draw square labels (transform centers back to frame space)
+    for square, det in square_map.items():
+        color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+        
+        # Get center in warped space
+        cx_warped, cy_warped = det['center']
+        
+        # Transform back to frame space
+        pt_warped = np.array([[[cx_warped, cy_warped]]], dtype=np.float32)
+        pt_frame = cv2.perspectiveTransform(pt_warped, H_inv)[0][0]
+        
+        cx_frame, cy_frame = int(pt_frame[0]), int(pt_frame[1])
+        
+        cv2.circle(overlay, (cx_frame, cy_frame), 5, color, -1)
+        cv2.putText(overlay, square, (cx_frame + 10, cy_frame),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return overlay
+
+
+def draw_board_overlay(frame, square_map, H):
+    """Draw detected pieces on the original frame."""
+    overlay = frame.copy()
+    
+    # Draw board outline
+    corners = np.array([
+        [0, 0],
+        [BOARD_SIZE, 0],
+        [BOARD_SIZE, BOARD_SIZE],
+        [0, BOARD_SIZE]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    
+    H_inv = np.linalg.inv(H)
+    frame_corners = cv2.perspectiveTransform(corners, H_inv).astype(np.int32)
+    cv2.polylines(overlay, [frame_corners], True, (0, 255, 0), 3)
+    
+    # Draw grid
+    for i in range(1, 8):
+        # Vertical lines
+        line_start = np.array([[[i * SQUARE_SIZE, 0]]], dtype=np.float32)
+        line_end = np.array([[[i * SQUARE_SIZE, BOARD_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+        
+        # Horizontal lines
+        line_start = np.array([[[0, i * SQUARE_SIZE]]], dtype=np.float32)
+        line_end = np.array([[[BOARD_SIZE, i * SQUARE_SIZE]]], dtype=np.float32)
+        start_frame = cv2.perspectiveTransform(line_start, H_inv)[0][0].astype(int)
+        end_frame = cv2.perspectiveTransform(line_end, H_inv)[0][0].astype(int)
+        cv2.line(overlay, tuple(start_frame), tuple(end_frame), (0, 255, 0), 1)
+    
+    # Draw square labels
+    for square, det in square_map.items():
+        color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+        cx, cy = det['center']
+        cv2.circle(overlay, (int(cx), int(cy)), 5, color, -1)
+        cv2.putText(overlay, square, (int(cx) + 10, int(cy)),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return overlay
+
+
+# --------------------------------------------
+# MAIN LOOP
+# --------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Chess board FEN detection with homography")
+    parser.add_argument("--source", type=str, default=None,
+                       help="Camera index or video file (default: select from list)")
+    parser.add_argument("--model", type=str, required=True,
+                       help="Path to YOLO model weights")
+    parser.add_argument("--target-fen", type=str, default=None,
+                       help="Target FEN for validation")
+    parser.add_argument("--conf", type=float, default=0.3,
+                       help="Detection confidence threshold")
+    parser.add_argument("--use-bottom", action="store_true", default=True,
+                       help="Use bottom of bbox for square assignment (better for low angles)")
+    parser.add_argument("--nms", type=float, default=0.5,
+                       help="NMS IoU threshold for removing duplicate detections")
+    parser.add_argument("--no-auto", action="store_true",
+                       help="Skip automatic board detection")
+    
+    args = parser.parse_args()
+    
+    # Load model and source
+    print("Loading model...")
+    model = load_yolo_model(args.model)
+    print("Opening video source...")
+    cap = open_source(args.source)
+    
+    H = None
+    src_corners = None
+    paused = False
+    last_fen = None
+    
+    print("\n" + "="*60)
+    print("CONTROLS:")
+    print("  a = auto-detect board corners")
+    print("  m = manual corner selection")
+    print("  p = pause/unpause")
+    print("  r = reset homography")
+    print("  q = quit")
+    print("="*60 + "\n")
+    
+    while True:
+        if not paused:
+            ret, frame = cap.read()
+            if not ret:
+                print("End of video/stream")
+                break
+        
+        disp = frame.copy()
+        
+        # Try auto-detection once at start (if allowed)
+        if H is None and not args.no_auto and src_corners is None:
+            auto_corners = detect_board_corners_auto(frame)
+            if auto_corners is not None:
+                src_corners = auto_corners
+                H = compute_homography(src_corners)
+                print("✓ Auto-detected board corners")
+        
+        # Process frame if we have homography
+        if H is not None:
+            # WARP FIRST, then detect on warped image
+            warped = warp_board(frame, H)
+            
+            # Detect pieces on warped board (better for model)
+            detections = detect_pieces(model, warped, args.conf)
+            
+            # Map to squares (detections already in warped space)
+            square_map = assign_detections_to_warped(
+                detections, 
+                use_bottom=args.use_bottom,
+                nms_threshold=args.nms
+            )
+            
+            # Generate FEN
+            fen = square_map_to_fen(square_map)
+            
+            # Print FEN if changed
+            if fen != last_fen:
+                print(f"\nFEN: {fen}")
+                print(f"Pieces detected: {len(square_map)}")
+                # Print piece positions for debugging
+                if square_map:
+                    squares_sorted = sorted(square_map.keys())
+                    print(f"Squares: {', '.join(squares_sorted)}")
+                last_fen = fen
+            
+            # Draw overlay on original frame
+            disp = draw_board_overlay_warped(frame, warped, square_map, H)
+            
+            # Draw detections on warped view for debugging
+            warped_display = warped.copy()
+            for square, det in square_map.items():
+                # Draw bbox
+                x1, y1, x2, y2 = det['bbox']
+                color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+                cv2.rectangle(warped_display, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                
+                # Draw center point used for square assignment
+                if args.use_bottom:
+                    cx = (x1 + x2) / 2
+                    cy = y2  # Bottom
+                else:
+                    cx, cy = det['center']
+                
+                cv2.circle(warped_display, (int(cx), int(cy)), 5, color, -1)
+                cv2.putText(warped_display, square, (int(cx) + 10, int(cy)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Draw grid on warped view
+            for i in range(9):
+                # Vertical lines
+                x = i * SQUARE_SIZE
+                cv2.line(warped_display, (x, 0), (x, BOARD_SIZE), (0, 255, 255), 1)
+                # Horizontal lines  
+                y = i * SQUARE_SIZE
+                cv2.line(warped_display, (0, y), (BOARD_SIZE, y), (0, 255, 255), 1)
+            
+            cv2.putText(warped_display, f"Pieces: {len(square_map)}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.imshow("Warped Board", warped_display)
+            
+            # Compare with target if provided
+            if args.target_fen:
+                diffs = compare_fen(fen, args.target_fen)
+                if not diffs:
+                    cv2.putText(disp, "CORRECT!", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                else:
+                    cv2.putText(disp, f"{len(diffs)} errors", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                    print(f"\nMismatches ({len(diffs)}):")
+                    for d in diffs[:10]:  # Show first 10
+                        print(f"  {d['square']}: got '{d['detected']}' expected '{d['expected']}'")
+        
+        else:
+            cv2.putText(disp, "Press 'a' for auto or 'm' for manual", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        # Draw corner markers if we have them
+        if src_corners is not None:
+            labels = ['h8', 'a8', 'a1', 'h1']
+            for i, pt in enumerate(src_corners):
+                cv2.circle(disp, (int(pt[0]), int(pt[1])), 8, (0, 255, 0), -1)
+                cv2.putText(disp, labels[i], (int(pt[0]) + 10, int(pt[1]) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        cv2.imshow("Chess Board Detection", disp)
+        
+        # Handle keys
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            paused = not paused
+            print(f"{'Paused' if paused else 'Resumed'}")
+        elif key == ord('a'):
+            auto_corners = detect_board_corners_auto(frame)
+            if auto_corners is not None:
+                src_corners = auto_corners
+                H = compute_homography(src_corners)
+                print("✓ Auto-detected board corners")
+            else:
+                print("✗ Auto-detection failed. Try manual (press 'm')")
+        elif key == ord('m'):
+            manual_corners = get_manual_corners(frame)
+            if manual_corners is not None:
+                src_corners = manual_corners
+                H = compute_homography(src_corners)
+                print("✓ Manual corners set")
+            else:
+                print("✗ Manual selection canceled")
+        elif key == ord('r'):
+            H = None
+            src_corners = None
+            last_fen = None
+            print("Reset homography")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    if last_fen:
+        print(f"\nFinal FEN: {last_fen}")
+
 
 if __name__ == "__main__":
     main()
