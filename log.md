@@ -141,3 +141,12 @@ Fixed the king/queen problem and added some thresholding for black pawn/bishops.
 2. Automatic corner detection is a complete mess; will need to start using manual from go until it's fixed.
 
 Next step: getting a video from a higher angle and with better lighting conditions.
+
+## 1653
+Changed homography code to try placing the lower part of the bounding box inside a given square, which helped a little, but I think the problem is ultimately a bad angle. Recommend shooting video from a higher angle and better lighting conditions.
+
+## 1828
+Improvised a setup that will allow recording with the phone. It'll be static video, but should be fine for demo purposes. For this part, the Garry Kasparov vs. Deep Blue games should be appropriate targets. [Kasparov vs. Deep Blue - The Match that Changed History](https://www.chess.com/article/view/deep-blue-kasparov-chess).
+
+## 1855
+Phone recording from a slightly higher angle had the same results with homography.
