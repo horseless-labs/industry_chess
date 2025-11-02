@@ -131,3 +131,6 @@ wandb:            val/dfl_loss 1.01223
 Two notes:
 1. The author of the dataset, like me, accidentally confused the king and queen pieces. TODO: just reverse the labels.
 2. We're early in testing, but it looks like these models in general will sometimes have difficulty distinguishing black pawns and black bishops.
+
+## 1510
+Fixed the king/queen problem and added some thresholding for black pawn/bishops. TODO: refine later.
