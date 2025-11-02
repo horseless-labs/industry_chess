@@ -39,6 +39,101 @@ import torch
 from PIL import Image
 
 
+# ---------------------------
+# Label fixes and refinements
+# ---------------------------
+
+# Fix king/queen confusion in dataset
+LABEL_FIXES = {
+    'white_king': 'white_queen',
+    'white_queen': 'white_king',
+    'black_king': 'black_queen',
+    'black_queen': 'black_king',
+}
+
+# Enable/disable fixes (set to False to see original labels)
+APPLY_KING_QUEEN_FIX = True
+APPLY_BISHOP_PAWN_FIX = True
+
+
+def fix_label(label: str) -> str:
+    """Apply label fixes (e.g., swap king/queen)."""
+    if APPLY_KING_QUEEN_FIX:
+        return LABEL_FIXES.get(label, label)
+    return label
+
+
+def refine_detection(det: Dict, img_height: int) -> Dict:
+    """
+    Refine detection using confidence and position heuristics.
+    
+    Args:
+        det: Detection dict with 'bbox', 'confidence', 'class'
+        img_height: Image height for position calculations
+    
+    Returns:
+        Refined detection dict
+    """
+    if not APPLY_BISHOP_PAWN_FIX:
+        return det
+    
+    label = det['class']
+    conf = det['confidence']
+    bbox = det['bbox']
+    
+    # Calculate vertical position (0 = top, 1 = bottom)
+    y_center = (bbox[1] + bbox[3]) / 2
+    y_ratio = y_center / img_height
+    
+    # Only refine low-confidence bishop/pawn detections
+    if conf < 0.75 and ('bishop' in label or 'pawn' in label):
+        color = 'white' if 'white' in label else 'black'
+        
+        # For white pieces (bottom of image from white's perspective)
+        if 'white' in label:
+            if 'pawn' in label and y_ratio < 0.35:
+                # White pawn in top third? Probably a bishop
+                det['class'] = f'{color}_bishop'
+                det['refined'] = True
+            elif 'bishop' in label and y_ratio > 0.75:
+                # White bishop in bottom area? Probably a pawn
+                det['class'] = f'{color}_pawn'
+                det['refined'] = True
+        
+        # For black pieces (top of image from white's perspective)
+        else:
+            if 'pawn' in label and y_ratio < 0.25:
+                # Black pawn very high? Probably a bishop
+                det['class'] = f'{color}_bishop'
+                det['refined'] = True
+            elif 'bishop' in label and y_ratio > 0.65:
+                # Black bishop moving forward? Might be pawn
+                det['class'] = f'{color}_pawn'
+                det['refined'] = True
+    
+    return det
+
+
+def should_filter_detection(det: Dict) -> bool:
+    """
+    Filter out uncertain bishop/pawn detections.
+    
+    Returns:
+        True if detection should be filtered out
+    """
+    if not APPLY_BISHOP_PAWN_FIX:
+        return False
+    
+    label = det['class']
+    conf = det['confidence']
+    
+    # Filter very low confidence bishop/pawn detections
+    if ('bishop' in label or 'pawn' in label) and conf < 0.50:
+        return True
+    
+    return False
+
+
 def load_yolo_model(model_path: Path):
     """Load YOLO model."""
     try:
@@ -80,6 +175,7 @@ def test_yolo_image(model, image_path: Path, conf_threshold: float = 0.25, save_
     
     # Get image
     img = cv2.imread(str(image_path))
+    img_height = img.shape[0]
     
     # Draw detections
     detections = []
@@ -89,18 +185,41 @@ def test_yolo_image(model, image_path: Path, conf_threshold: float = 0.25, save_
         cls = int(box.cls[0])
         label = results.names[cls]
         
-        detections.append({
+        # Create detection dict
+        det = {
             'bbox': [x1, y1, x2, y2],
             'confidence': conf,
-            'class': label
-        })
+            'class': label,
+            'refined': False
+        }
+        
+        # Apply label fixes
+        det['class'] = fix_label(det['class'])
+        
+        # Refine using heuristics
+        det = refine_detection(det, img_height)
+        
+        # Filter uncertain detections
+        if should_filter_detection(det):
+            continue
+        
+        detections.append(det)
         
         # Draw box
+        label = det['class']
         color = (0, 255, 0) if 'white' in label else (255, 0, 0)
+        
+        # Use orange color if refined by heuristics
+        if det.get('refined', False):
+            color = (0, 165, 255)  # Orange = auto-corrected
+        
         cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
         
         # Draw label
         text = f"{label} {conf:.2f}"
+        if det.get('refined', False):
+            text += " *"  # Mark refined detections
+        
         (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         cv2.rectangle(img, (int(x1), int(y1) - text_h - 10), (int(x1) + text_w, int(y1)), color, -1)
         cv2.putText(img, text, (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
@@ -209,6 +328,7 @@ def test_video(model, video_path: Path, detector_type: str, device: torch.device
     
     frame_idx = 0
     total_detections = 0
+    refined_count = 0
     
     print("Processing video... (press 'q' to quit)")
     
@@ -218,6 +338,7 @@ def test_video(model, video_path: Path, detector_type: str, device: torch.device
             break
         
         frame_idx += 1
+        img_height = frame.shape[0]
         
         if detector_type == 'yolo':
             # YOLO inference
@@ -229,12 +350,39 @@ def test_video(model, video_path: Path, detector_type: str, device: torch.device
                 cls = int(box.cls[0])
                 label = results.names[cls]
                 
+                # Create detection dict
+                det = {
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': conf,
+                    'class': label,
+                    'refined': False
+                }
+                
+                # Apply label fixes
+                det['class'] = fix_label(det['class'])
+                
+                # Refine using heuristics
+                det = refine_detection(det, img_height)
+                
+                # Filter uncertain detections
+                if should_filter_detection(det):
+                    continue
+                
                 total_detections += 1
+                if det.get('refined', False):
+                    refined_count += 1
+                
+                label = det['class']
                 
                 # Draw
                 color = (0, 255, 0) if 'white' in label else (255, 0, 0)
+                if det.get('refined', False):
+                    color = (0, 165, 255)  # Orange for refined
+                
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 text = f"{label} {conf:.2f}"
+                if det.get('refined', False):
+                    text += " *"
                 cv2.putText(frame, text, (int(x1), int(y1) - 5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
@@ -260,12 +408,39 @@ def test_video(model, video_path: Path, detector_type: str, device: torch.device
                 x1, y1, x2, y2 = box
                 label = id_to_label[label_id]
                 
+                # Create detection dict
+                det = {
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': float(conf),
+                    'class': label,
+                    'refined': False
+                }
+                
+                # Apply label fixes
+                det['class'] = fix_label(det['class'])
+                
+                # Refine using heuristics
+                det = refine_detection(det, img_height)
+                
+                # Filter uncertain detections
+                if should_filter_detection(det):
+                    continue
+                
                 total_detections += 1
+                if det.get('refined', False):
+                    refined_count += 1
+                
+                label = det['class']
                 
                 # Draw
                 color = (0, 255, 0) if 'white' in label else (255, 0, 0)
+                if det.get('refined', False):
+                    color = (0, 165, 255)
+                
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 text = f"{label} {conf:.2f}"
+                if det.get('refined', False):
+                    text += " *"
                 cv2.putText(frame, text, (int(x1), int(y1) - 5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
@@ -292,6 +467,7 @@ def test_video(model, video_path: Path, detector_type: str, device: torch.device
     
     print(f"\nProcessed {frame_idx} frames")
     print(f"Total detections: {total_detections}")
+    print(f"Auto-corrected detections: {refined_count} ({refined_count/max(1,total_detections)*100:.1f}%)")
     print(f"Average detections per frame: {total_detections/frame_idx:.1f}")
 
 
