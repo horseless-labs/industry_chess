@@ -150,3 +150,6 @@ Improvised a setup that will allow recording with the phone. It'll be static vid
 
 ## 1855
 Phone recording from a slightly higher angle had the same results with homography.
+
+## 1920
+Rewrote the model to detect on original images instead of the homographically warped ones; the latter was overcounting the pieces and placing them in multiple squares. Current command for a nice demo output is `python3 chess_homography.py --source data/preliminary_videos/phone_video.mp4 --model runs/detect/train/weights/best.pt --use-bottom --nms 0.3 --conf 0.5`

@@ -337,15 +337,79 @@ def point_to_square(x, y):
     return f"{file_char}{rank_num}"
 
 
-def assign_detections_to_warped(detections):
+def assign_detections_from_original(detections, H, use_bottom=True, nms_threshold=0.5):
     """
-    Map detections (already in warped board space) directly to squares.
+    Map detections from original frame space to board squares.
+    
+    Args:
+        detections: List of detection dicts (in original frame coordinates)
+        H: Homography matrix (frame -> warped board)
+        use_bottom: If True, use bottom-center of bbox instead of center
+        nms_threshold: IoU threshold for non-maximum suppression
+    
     Returns dict: {square_name: detection}
     """
+    # First, apply NMS to remove duplicate detections in original frame space
+    detections = non_maximum_suppression(detections, nms_threshold)
+    
     square_map = {}
     
     for det in detections:
-        cx, cy = det["center"]
+        if use_bottom:
+            # Use bottom-center of bounding box (where piece base is)
+            x1, y1, x2, y2 = det["bbox"]
+            cx = (x1 + x2) / 2
+            cy = y2  # Bottom of box (piece base)
+        else:
+            cx, cy = det["center"]
+        
+        # Transform this point to warped board space
+        pt = np.array([[[cx, cy]]], dtype=np.float32)
+        warped_pt = cv2.perspectiveTransform(pt, H)[0][0]
+        
+        wx, wy = warped_pt
+        square = point_to_square(wx, wy)
+        
+        if square is None:
+            continue
+        
+        # Store detection with warped coordinates for visualization
+        det_copy = det.copy()
+        det_copy["warped_center"] = (wx, wy)
+        
+        # If multiple pieces map to same square, keep highest confidence
+        if square not in square_map or det["confidence"] > square_map[square]["confidence"]:
+            square_map[square] = det_copy
+    
+    return square_map
+
+
+def assign_detections_to_warped(detections, use_bottom=True, nms_threshold=0.5):
+    """
+    Map detections (already in warped board space) directly to squares.
+    
+    Args:
+        detections: List of detection dicts
+        use_bottom: If True, use bottom-center of bbox instead of center
+                   (better for tall pieces viewed from low angles)
+        nms_threshold: IoU threshold for non-maximum suppression
+    
+    Returns dict: {square_name: detection}
+    """
+    # First, apply NMS to remove duplicate detections of same piece
+    detections = non_maximum_suppression(detections, nms_threshold)
+    
+    square_map = {}
+    
+    for det in detections:
+        if use_bottom:
+            # Use bottom-center of bounding box (where piece base is)
+            x1, y1, x2, y2 = det["bbox"]
+            cx = (x1 + x2) / 2
+            cy = y2  # Bottom of box (piece base)
+        else:
+            cx, cy = det["center"]
+        
         square = point_to_square(cx, cy)
         
         if square is None:
@@ -356,6 +420,56 @@ def assign_detections_to_warped(detections):
             square_map[square] = det
     
     return square_map
+
+
+def compute_iou(box1, box2):
+    """Compute IoU between two bounding boxes [x1, y1, x2, y2]."""
+    x1_inter = max(box1[0], box2[0])
+    y1_inter = max(box1[1], box2[1])
+    x2_inter = min(box1[2], box2[2])
+    y2_inter = min(box1[3], box2[3])
+    
+    if x2_inter < x1_inter or y2_inter < y1_inter:
+        return 0.0
+    
+    inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+    
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def non_maximum_suppression(detections, iou_threshold=0.5):
+    """
+    Apply NMS to remove duplicate detections of the same piece.
+    Keeps detection with highest confidence when IoU > threshold.
+    """
+    if len(detections) <= 1:
+        return detections
+    
+    # Sort by confidence (highest first)
+    sorted_dets = sorted(detections, key=lambda d: d["confidence"], reverse=True)
+    
+    keep = []
+    
+    while sorted_dets:
+        # Keep highest confidence detection
+        best = sorted_dets.pop(0)
+        keep.append(best)
+        
+        # Remove detections that overlap significantly with best
+        filtered = []
+        for det in sorted_dets:
+            iou = compute_iou(best["bbox"], det["bbox"])
+            if iou < iou_threshold:
+                filtered.append(det)
+        
+        sorted_dets = filtered
+    
+    return keep
 
 
 def assign_detections_to_squares(detections, H):
@@ -589,6 +703,10 @@ def main():
                        help="Target FEN for validation")
     parser.add_argument("--conf", type=float, default=0.3,
                        help="Detection confidence threshold")
+    parser.add_argument("--use-bottom", action="store_true", default=True,
+                       help="Use bottom of bbox for square assignment (better for low angles)")
+    parser.add_argument("--nms", type=float, default=0.5,
+                       help="NMS IoU threshold for removing duplicate detections")
     parser.add_argument("--no-auto", action="store_true",
                        help="Skip automatic board detection")
     
@@ -633,14 +751,19 @@ def main():
         
         # Process frame if we have homography
         if H is not None:
-            # WARP FIRST, then detect on warped image
+            # Detect on ORIGINAL frame (better - avoids warping artifacts)
+            detections = detect_pieces(model, frame, args.conf)
+            
+            # Map to squares using homography transformation
+            square_map = assign_detections_from_original(
+                detections, 
+                H,
+                use_bottom=args.use_bottom,
+                nms_threshold=args.nms
+            )
+            
+            # Generate warped view for visualization
             warped = warp_board(frame, H)
-            
-            # Detect pieces on warped board (better for model)
-            detections = detect_pieces(model, warped, args.conf)
-            
-            # Map to squares (detections already in warped space)
-            square_map = assign_detections_to_warped(detections)
             
             # Generate FEN
             fen = square_map_to_fen(square_map)
@@ -655,17 +778,43 @@ def main():
                     print(f"Squares: {', '.join(squares_sorted)}")
                 last_fen = fen
             
-            # Draw overlay on original frame
-            disp = draw_board_overlay_warped(frame, warped, square_map, H)
+            # Draw overlay on original frame with detections
+            disp = frame.copy()
             
-            # Draw detections on warped view for debugging
-            warped_display = warped.copy()
+            # Draw board grid
+            H_inv = np.linalg.inv(H)
+            corners = np.array([
+                [0, 0],
+                [BOARD_SIZE, 0],
+                [BOARD_SIZE, BOARD_SIZE],
+                [0, BOARD_SIZE]
+            ], dtype=np.float32).reshape(-1, 1, 2)
+            frame_corners = cv2.perspectiveTransform(corners, H_inv).astype(np.int32)
+            cv2.polylines(disp, [frame_corners], True, (0, 255, 0), 3)
+            
+            # Draw detections and labels on original frame
             for square, det in square_map.items():
-                cx, cy = det['center']
+                x1, y1, x2, y2 = det['bbox']
                 color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
-                cv2.circle(warped_display, (int(cx), int(cy)), 5, color, -1)
-                cv2.putText(warped_display, square, (int(cx) + 10, int(cy)),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Draw bounding box
+                cv2.rectangle(disp, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                
+                # Draw point used for assignment
+                if args.use_bottom:
+                    cx = (x1 + x2) / 2
+                    cy = y2
+                else:
+                    cx, cy = det['center']
+                
+                cv2.circle(disp, (int(cx), int(cy)), 5, color, -1)
+                
+                # Draw square label
+                cv2.putText(disp, square, (int(x1), int(y1) - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Draw warped view with square assignments for debugging
+            warped_display = warped.copy()
             
             # Draw grid on warped view
             for i in range(9):
@@ -675,6 +824,15 @@ def main():
                 # Horizontal lines  
                 y = i * SQUARE_SIZE
                 cv2.line(warped_display, (0, y), (BOARD_SIZE, y), (0, 255, 255), 1)
+            
+            # Draw square labels at transformed positions
+            for square, det in square_map.items():
+                if "warped_center" in det:
+                    wx, wy = det["warped_center"]
+                    color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+                    cv2.circle(warped_display, (int(wx), int(wy)), 5, color, -1)
+                    cv2.putText(warped_display, square, (int(wx) + 10, int(wy)),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
             cv2.putText(warped_display, f"Pieces: {len(square_map)}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
