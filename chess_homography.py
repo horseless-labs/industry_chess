@@ -707,6 +707,10 @@ def main():
                        help="Use bottom of bbox for square assignment (better for low angles)")
     parser.add_argument("--nms", type=float, default=0.5,
                        help="NMS IoU threshold for removing duplicate detections")
+    parser.add_argument("--save-video", action="store_true",
+                       help="Save output video with overlays")
+    parser.add_argument("--output-dir", type=Path, default=Path("output_videos"),
+                       help="Directory to save output videos")
     parser.add_argument("--no-auto", action="store_true",
                        help="Skip automatic board detection")
     
@@ -717,6 +721,30 @@ def main():
     model = load_yolo_model(args.model)
     print("Opening video source...")
     cap = open_source(args.source)
+    
+    # Setup video writer if saving
+    writer = None
+    if args.save_video:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Generate output filename
+        if args.source:
+            try:
+                source_name = Path(args.source).stem
+            except:
+                source_name = f"camera_{args.source}"
+        else:
+            source_name = "camera"
+        
+        output_path = args.output_dir / f"{source_name}_annotated.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        print(f"Will save video to: {output_path}")
     
     H = None
     src_corners = None
@@ -809,9 +837,32 @@ def main():
                 
                 cv2.circle(disp, (int(cx), int(cy)), 5, color, -1)
                 
-                # Draw square label
-                cv2.putText(disp, square, (int(x1), int(y1) - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                # Draw label with piece name and square
+                piece_name = det['class'].replace('_', ' ').title()
+                label = f"{piece_name} @ {square}"
+                conf_pct = int(det['confidence'] * 100)
+                full_label = f"{label} ({conf_pct}%)"
+                
+                # Create background for text
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 2
+                (text_w, text_h), baseline = cv2.getTextSize(full_label, font, font_scale, thickness)
+                
+                # Position label above bbox
+                label_y = int(y1) - 10
+                if label_y < text_h + 10:
+                    label_y = int(y2) + text_h + 10  # Put below if too close to top
+                
+                # Draw background rectangle
+                cv2.rectangle(disp, 
+                             (int(x1), label_y - text_h - 5),
+                             (int(x1) + text_w + 10, label_y + 5),
+                             color, -1)
+                
+                # Draw text
+                cv2.putText(disp, full_label, (int(x1) + 5, label_y),
+                           font, font_scale, (255, 255, 255), thickness)
             
             # Draw warped view with square assignments for debugging
             warped_display = warped.copy()
@@ -865,6 +916,10 @@ def main():
         
         cv2.imshow("Chess Board Detection", disp)
         
+        # Save frame to video if enabled
+        if writer is not None:
+            writer.write(disp)
+        
         # Handle keys
         key = cv2.waitKey(1) & 0xFF
         
@@ -896,6 +951,9 @@ def main():
             print("Reset homography")
     
     cap.release()
+    if writer is not None:
+        writer.release()
+        print(f"\n✓ Video saved to: {output_path}")
     cv2.destroyAllWindows()
     
     if last_fen:
