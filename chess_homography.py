@@ -30,6 +30,23 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+# Try to import chess libraries
+try:
+    import chess
+    import chess.pgn
+    import chess.svg
+    from cairosvg import svg2png
+    HAS_CHESS_RENDERING = True
+except ImportError:
+    try:
+        import chess
+        import chess.pgn
+        HAS_CHESS_RENDERING = False
+        print("Note: cairosvg not available. Using fallback board rendering.")
+    except ImportError:
+        HAS_CHESS_RENDERING = False
+        print("Note: python-chess not available. Board visualization will be limited.")
+
 # --------------------------------------------
 # CONFIG
 # --------------------------------------------
@@ -501,6 +518,147 @@ def assign_detections_to_squares(detections, H):
 
 
 # --------------------------------------------
+# BOARD VISUALIZATION
+# --------------------------------------------
+
+def render_board_from_fen(fen_string, size=400):
+    """
+    Render a chess board from FEN notation as an image.
+    Returns numpy array (BGR format for OpenCV) or None if rendering unavailable.
+    
+    Args:
+        fen_string: FEN notation string
+        size: Size of the board in pixels (square)
+    """
+    if not HAS_CHESS_RENDERING:
+        return None
+    
+    try:
+        # Parse FEN
+        board = chess.Board(fen_string)
+        
+        # Generate SVG
+        svg_data = chess.svg.board(
+            board,
+            size=size,
+            coordinates=True,
+            colors={
+                "square light": "#f0d9b5",
+                "square dark": "#b58863",
+                "square dark lastmove": "#aaa23a",
+                "square light lastmove": "#cdd26a"
+            }
+        )
+        
+        # Convert SVG to PNG
+        png_data = svg2png(bytestring=svg_data.encode('utf-8'))
+        
+        # Convert to numpy array
+        nparr = np.frombuffer(png_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        return img
+    
+    except Exception as e:
+        print(f"Error rendering board: {e}")
+        return None
+
+
+def create_fallback_board_image(fen_string, size=400):
+    """
+    Create a simple text-based board visualization as fallback.
+    
+    Args:
+        fen_string: FEN notation string
+        size: Size of the board in pixels
+    """
+    img = np.ones((size, size, 3), dtype=np.uint8) * 255
+    
+    # Parse FEN placement
+    try:
+        board = chess.Board(fen_string)
+        square_size = size // 8
+        
+        # Unicode chess pieces
+        piece_symbols = {
+            'P': '♙', 'N': '♘', 'B': '♗', 'R': '♖', 'Q': '♕', 'K': '♔',
+            'p': '♟', 'n': '♞', 'b': '♝', 'r': '♜', 'q': '♛', 'k': '♚'
+        }
+        
+        # Draw checkerboard
+        for rank in range(8):
+            for file in range(8):
+                x = file * square_size
+                y = rank * square_size
+                
+                # Alternate colors
+                if (rank + file) % 2 == 0:
+                    color = (240, 217, 181)  # Light square
+                else:
+                    color = (181, 136, 99)   # Dark square
+                
+                cv2.rectangle(img, (x, y), (x + square_size, y + square_size), color, -1)
+        
+        # Draw pieces
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for rank in range(8):
+            for file in range(8):
+                square = chess.square(file, 7 - rank)  # Flip rank for display
+                piece = board.piece_at(square)
+                
+                if piece:
+                    symbol = piece_symbols.get(piece.symbol(), piece.symbol())
+                    x = file * square_size + square_size // 4
+                    y = rank * square_size + square_size * 3 // 4
+                    
+                    # Choose color based on piece color
+                    text_color = (50, 50, 50) if piece.color == chess.WHITE else (10, 10, 10)
+                    
+                    cv2.putText(img, symbol, (x, y), font, 1.2, text_color, 2)
+        
+        # Add file/rank labels
+        font_scale = 0.4
+        for i in range(8):
+            # Files (a-h)
+            file_label = chr(ord('a') + i)
+            cv2.putText(img, file_label, (i * square_size + square_size // 2 - 5, size - 5),
+                       font, font_scale, (100, 100, 100), 1)
+            
+            # Ranks (8-1)
+            rank_label = str(8 - i)
+            cv2.putText(img, rank_label, (5, i * square_size + square_size // 2 + 5),
+                       font, font_scale, (100, 100, 100), 1)
+        
+        return img
+    
+    except Exception as e:
+        # Ultimate fallback - just show FEN text
+        img = np.ones((size, size, 3), dtype=np.uint8) * 255
+        cv2.putText(img, "Board Display Error", (20, size // 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(img, fen_string.split()[0], (10, size // 2 + 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        return img
+
+
+def get_board_visualization(fen_string, size=400):
+    """
+    Get board visualization from FEN, with fallback options.
+    
+    Returns:
+        numpy array (BGR image) of the board
+    """
+    # Try high-quality SVG rendering first
+    if HAS_CHESS_RENDERING:
+        board_img = render_board_from_fen(fen_string, size)
+        if board_img is not None:
+            return board_img
+    
+    # Fallback to simple rendering
+    return create_fallback_board_image(fen_string, size)
+
+
+# --------------------------------------------
 # FEN GENERATION
 # --------------------------------------------
 def square_map_to_fen(square_map):
@@ -758,6 +916,9 @@ def main():
     print("  p = pause/unpause")
     print("  r = reset homography")
     print("  q = quit")
+    if not HAS_CHESS_RENDERING:
+        print("\nNote: Install python-chess and cairosvg for better board rendering:")
+        print("  pip install python-chess cairosvg")
     print("="*60 + "\n")
     
     while True:
@@ -805,6 +966,32 @@ def main():
                     squares_sorted = sorted(square_map.keys())
                     print(f"Squares: {', '.join(squares_sorted)}")
                 last_fen = fen
+            
+            # Create board visualization window
+            board_viz = get_board_visualization(fen, size=500)
+            
+            # Add FEN text below board
+            viz_height = board_viz.shape[0]
+            viz_width = board_viz.shape[1]
+            
+            # Create extended image with space for text
+            extended_viz = np.ones((viz_height + 100, viz_width, 3), dtype=np.uint8) * 255
+            extended_viz[0:viz_height, :] = board_viz
+            
+            # Add title
+            cv2.putText(extended_viz, "Detected Board State", (10, viz_height + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+            
+            # Add piece count
+            cv2.putText(extended_viz, f"Pieces: {len(square_map)}", (10, viz_height + 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 0), 1)
+            
+            # Add FEN notation (truncated if too long)
+            fen_display = fen if len(fen) < 60 else fen[:57] + "..."
+            cv2.putText(extended_viz, f"FEN: {fen_display}", (10, viz_height + 85),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+            
+            cv2.imshow("Board Visualization", extended_viz)
             
             # Draw overlay on original frame with detections
             disp = frame.copy()
