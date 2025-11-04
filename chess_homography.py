@@ -329,6 +329,118 @@ def detect_pieces(model, frame, conf_threshold=0.3):
 
 
 # --------------------------------------------
+# TEMPORAL SMOOTHING
+# --------------------------------------------
+
+class TemporalSmoother:
+    """
+    Smooth detections over time using a sliding window.
+    Helps stabilize flickering piece classifications.
+    """
+    
+    def __init__(self, window_size=10, confidence_threshold=0.6):
+        """
+        Args:
+            window_size: Number of frames to consider for smoothing
+            confidence_threshold: Minimum agreement ratio to accept a classification
+        """
+        self.window_size = window_size
+        self.confidence_threshold = confidence_threshold
+        self.history = {}  # square -> list of (class_name, confidence) tuples
+    
+    def update(self, square_map):
+        """
+        Update history with new detections and return smoothed square map.
+        
+        Args:
+            square_map: Dict of {square: detection_dict}
+        
+        Returns:
+            Smoothed square_map with stabilized classifications
+        """
+        # Update history for each square
+        current_squares = set(square_map.keys())
+        
+        # Add new detections to history
+        for square, det in square_map.items():
+            if square not in self.history:
+                self.history[square] = []
+            
+            self.history[square].append({
+                'class': det['class'],
+                'confidence': det['confidence']
+            })
+            
+            # Keep only last N frames
+            if len(self.history[square]) > self.window_size:
+                self.history[square].pop(0)
+        
+        # Remove history for squares that haven't been detected recently
+        all_squares = set(self.history.keys())
+        for square in all_squares:
+            # If square not detected in current frame, add a "None" entry
+            if square not in current_squares:
+                self.history[square].append(None)
+                if len(self.history[square]) > self.window_size:
+                    self.history[square].pop(0)
+                
+                # Remove history if piece hasn't been seen for a while
+                none_count = sum(1 for x in self.history[square] if x is None)
+                if none_count > self.window_size // 2:
+                    del self.history[square]
+        
+        # Create smoothed square map
+        smoothed_map = {}
+        
+        for square, det in square_map.items():
+            if square not in self.history or len(self.history[square]) < 3:
+                # Not enough history, use current detection
+                smoothed_map[square] = det
+                continue
+            
+            # Count class occurrences in history (ignore None entries)
+            class_votes = {}
+            total_votes = 0
+            confidence_sum = {}
+            
+            for entry in self.history[square]:
+                if entry is not None:
+                    cls = entry['class']
+                    conf = entry['confidence']
+                    class_votes[cls] = class_votes.get(cls, 0) + 1
+                    confidence_sum[cls] = confidence_sum.get(cls, 0) + conf
+                    total_votes += 1
+            
+            if total_votes == 0:
+                smoothed_map[square] = det
+                continue
+            
+            # Find most common class
+            most_common_class = max(class_votes.items(), key=lambda x: x[1])[0]
+            vote_ratio = class_votes[most_common_class] / total_votes
+            
+            # If confidence is high enough, use the most common class
+            if vote_ratio >= self.confidence_threshold:
+                # Use smoothed class but keep current bbox and other info
+                smoothed_det = det.copy()
+                smoothed_det['class'] = most_common_class
+                smoothed_det['smoothed'] = True
+                smoothed_det['vote_ratio'] = vote_ratio
+                # Use average confidence for the smoothed class
+                smoothed_det['confidence'] = confidence_sum[most_common_class] / class_votes[most_common_class]
+                smoothed_map[square] = smoothed_det
+            else:
+                # Not confident enough, use current detection
+                smoothed_map[square] = det
+        
+        return smoothed_map
+    
+    def reset(self):
+        """Clear all history."""
+        self.history = {}
+
+
+# --------------------------------------------
 # MAPPING TO SQUARES
 # --------------------------------------------
 def point_to_square(x, y):
@@ -865,6 +977,10 @@ def main():
                        help="Use bottom of bbox for square assignment (better for low angles)")
     parser.add_argument("--nms", type=float, default=0.5,
                        help="NMS IoU threshold for removing duplicate detections")
+    parser.add_argument("--smooth-window", type=int, default=10,
+                       help="Number of frames for temporal smoothing (0 to disable)")
+    parser.add_argument("--smooth-threshold", type=float, default=0.6,
+                       help="Confidence threshold for temporal smoothing (0.5-1.0)")
     parser.add_argument("--save-video", action="store_true",
                        help="Save output video with overlays")
     parser.add_argument("--output-dir", type=Path, default=Path("output_videos"),
@@ -909,6 +1025,15 @@ def main():
     paused = False
     last_fen = None
     
+    # Initialize temporal smoother
+    smoother = None
+    if args.smooth_window > 0:
+        smoother = TemporalSmoother(
+            window_size=args.smooth_window,
+            confidence_threshold=args.smooth_threshold
+        )
+        print(f"Temporal smoothing enabled: window={args.smooth_window}, threshold={args.smooth_threshold}")
+    
     print("\n" + "="*60)
     print("CONTROLS:")
     print("  a = auto-detect board corners")
@@ -950,6 +1075,10 @@ def main():
                 use_bottom=args.use_bottom,
                 nms_threshold=args.nms
             )
+            
+            # Apply temporal smoothing if enabled
+            if smoother is not None:
+                square_map = smoother.update(square_map)
             
             # Generate warped view for visualization
             warped = warp_board(frame, H)
@@ -1012,6 +1141,10 @@ def main():
                 x1, y1, x2, y2 = det['bbox']
                 color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
                 
+                # Use different color if detection was smoothed
+                if det.get('smoothed', False):
+                    color = (0, 255, 255)  # Yellow for smoothed
+                
                 # Draw bounding box
                 cv2.rectangle(disp, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 
@@ -1028,7 +1161,13 @@ def main():
                 piece_name = det['class'].replace('_', ' ').title()
                 label = f"{piece_name} @ {square}"
                 conf_pct = int(det['confidence'] * 100)
-                full_label = f"{label} ({conf_pct}%)"
+                
+                # Add smoothing indicator
+                if det.get('smoothed', False):
+                    vote_pct = int(det.get('vote_ratio', 0) * 100)
+                    full_label = f"{label} ({conf_pct}% | S:{vote_pct}%)"
+                else:
+                    full_label = f"{label} ({conf_pct}%)"
                 
                 # Create background for text
                 font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1135,7 +1274,9 @@ def main():
             H = None
             src_corners = None
             last_fen = None
-            print("Reset homography")
+            if smoother is not None:
+                smoother.reset()
+            print("Reset homography and smoothing history")
     
     cap.release()
     if writer is not None:
