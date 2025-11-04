@@ -4,16 +4,16 @@ Chess board homography + FEN detection and validation.
 
 Usage:
     # Webcam with auto-selection
-    python chess_homography_fen.py --model best.pt
+    python chess_homography.py --model best.pt
     
     # Specific camera
-    python chess_homography_fen.py --model best.pt --source 0
+    python chess_homography.py --model best.pt --source 0
     
     # Video file
-    python chess_homography_fen.py --model best.pt --source game.mp4
+    python chess_homography.py --model best.pt --source game.mp4
     
     # With target FEN for validation
-    python chess_homography_fen.py --model best.pt --target-fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    python chess_homography.py --model best.pt --target-fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 Controls:
     a = auto-detect board corners
@@ -1139,11 +1139,8 @@ def main():
             # Draw detections and labels on original frame
             for square, det in square_map.items():
                 x1, y1, x2, y2 = det['bbox']
+                # Keep color based on piece color (don't change for smoothing)
                 color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
-                
-                # Use different color if detection was smoothed
-                if det.get('smoothed', False):
-                    color = (0, 255, 255)  # Yellow for smoothed
                 
                 # Draw bounding box
                 cv2.rectangle(disp, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
@@ -1162,7 +1159,7 @@ def main():
                 label = f"{piece_name} @ {square}"
                 conf_pct = int(det['confidence'] * 100)
                 
-                # Add smoothing indicator
+                # Add smoothing indicator to label only (not color)
                 if det.get('smoothed', False):
                     vote_pct = int(det.get('vote_ratio', 0) * 100)
                     full_label = f"{label} ({conf_pct}% | S:{vote_pct}%)"
