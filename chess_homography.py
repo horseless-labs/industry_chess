@@ -207,7 +207,7 @@ def get_manual_corners(frame):
     cv2.namedWindow(window_name)
     cv2.setMouseCallback(window_name, mouse_callback)
     
-    labels = ["h8 (top-left)", "a8 (top-right)", "a1 (bottom-right)", "h1 (bottom-left)"]
+    labels = ["h8 (top right of board)", "a8 (top left of board)", "a1 (bottom left of board)", "h1 (bottom right of board)"]
     
     while True:
         disp = temp.copy()
@@ -264,7 +264,10 @@ def order_points(pts):
     
     return rect
 
-
+# Further reading for cv2.findHomography
+# https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html#ga4abc2ece9fab9398f2e560d53c8c9780
+# and projective transformations
+# https://www.youtube.com/watch?v=2BIzmFD_pRQ
 def compute_homography(src_corners):
     """
     Compute homography from source corners to canonical board.
