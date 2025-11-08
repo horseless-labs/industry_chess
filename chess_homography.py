@@ -1214,6 +1214,9 @@ def main():
                 # Draw text
                 cv2.putText(disp, full_label, (int(x1) + 5, label_y),
                            font, font_scale, (255, 255, 255), thickness)
+                
+            # Draws the grid on top fo the chess board.
+            # disp = draw_board_overlay(frame, square_map, H)
             
             # Draw warped view with square assignments for debugging
             # Might remove later; board_viz is a general improvement over warped
