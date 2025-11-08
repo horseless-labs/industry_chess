@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 # Try to import chess libraries
+# TODO: figure out C++ port situation
 try:
     import chess
     import chess.pgn
@@ -54,6 +55,9 @@ BOARD_SIZE = 800  # warped board will be 800x800
 SQUARE_SIZE = BOARD_SIZE // 8
 
 # Label fixes (if your dataset has king/queen swapped)
+# Problem also came up *with* label fixes
+# TODO: double-check labeling in original dataset; this could be a detection
+#       problem instead of a labeling one.
 LABEL_FIXES = {
     'white_king': 'white_queen',
     'white_queen': 'white_king',
@@ -80,6 +84,8 @@ CLASS_TO_FEN = {
 
 # --------------------------------------------
 # CAMERA / SOURCE
+# Currently has user guess with the index
+# TODO: rewrite to display data relating name of device with index
 # --------------------------------------------
 def list_cameras(max_index=10):
     """Find available cameras."""
@@ -123,6 +129,10 @@ def open_source(source):
 
 # --------------------------------------------
 # BOARD DETECTION (AUTO)
+# Severe problems with automatic detection in testing; unsure if this is a
+# result of poor lighting conditions.
+# TODO: test with different lighting, other boards, etc.
+# TODO: consider removal.
 # --------------------------------------------
 def detect_board_corners_auto(frame):
     """
@@ -170,6 +180,7 @@ def detect_board_corners_auto(frame):
 
 # --------------------------------------------
 # MANUAL CORNER SELECTION
+# TODO: consider making this the default option
 # --------------------------------------------
 manual_points = []
 
@@ -234,6 +245,8 @@ def get_manual_corners(frame):
 
 # --------------------------------------------
 # HOMOGRAPHY / WARP
+# Implementation of schematic diagram output made this unnecessary
+# TODO: Consider removal.
 # --------------------------------------------
 def order_points(pts):
     """
@@ -486,6 +499,8 @@ def assign_detections_from_original(detections, H, use_bottom=True, nms_threshol
     for det in detections:
         if use_bottom:
             # Use bottom-center of bounding box (where piece base is)
+            # Reduces accidental detections across multiple squares from low
+            # angles.
             x1, y1, x2, y2 = det["bbox"]
             cx = (x1 + x2) / 2
             cy = y2  # Bottom of box (piece base)
@@ -533,6 +548,8 @@ def assign_detections_to_warped(detections, use_bottom=True, nms_threshold=0.5):
     for det in detections:
         if use_bottom:
             # Use bottom-center of bounding box (where piece base is)
+            # Reduces accidental detections across multiple squares from low
+            # angles.
             x1, y1, x2, y2 = det["bbox"]
             cx = (x1 + x2) / 2
             cy = y2  # Bottom of box (piece base)
@@ -570,8 +587,13 @@ def compute_iou(box1, box2):
     
     return inter_area / union_area if union_area > 0 else 0.0
 
-
-def non_maximum_suppression(detections, iou_threshold=0.5):
+"""
+Read that Soft-NMS variants are better for handling very crowded scenes
+# TODO: search for Soft-NMS
+# TODO: run tests to determine whether those are more performant, or if density
+        is still too low to be relevant here.
+"""
+def non_maximum_suppression(detections, iou_threshold=0.5): # IoU is intersection/union
     """
     Apply NMS to remove duplicate detections of the same piece.
     Keeps detection with highest confidence when IoU > threshold.
@@ -864,6 +886,7 @@ def compare_fen(detected_fen, target_fen):
 
 # --------------------------------------------
 # VISUALIZATION
+# Draws grids on their respective boards; currently not in use
 # --------------------------------------------
 def draw_board_overlay_warped(frame, warped, square_map, H):
     """Draw detected pieces from warped space back onto original frame."""
@@ -1056,6 +1079,8 @@ def main():
         disp = frame.copy()
         
         # Try auto-detection once at start (if allowed)
+        # TODO: disable until board can more reliably be detected
+        # TODO: find better board detection method
         if H is None and not args.no_auto and src_corners is None:
             auto_corners = detect_board_corners_auto(frame)
             if auto_corners is not None:
@@ -1075,13 +1100,14 @@ def main():
                 use_bottom=args.use_bottom,
                 nms_threshold=args.nms
             )
-            
+                        
             # Apply temporal smoothing if enabled
             if smoother is not None:
                 square_map = smoother.update(square_map)
             
             # Generate warped view for visualization
-            warped = warp_board(frame, H)
+            # Might remove later; not as good as board_viz for this purpose
+            # warped = warp_board(frame, H)
             
             # Generate FEN
             fen = square_map_to_fen(square_map)
@@ -1108,6 +1134,7 @@ def main():
             extended_viz[0:viz_height, :] = board_viz
             
             # Add title
+            # TODO: change fonts to be more readable
             cv2.putText(extended_viz, "Detected Board State", (10, viz_height + 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
             
@@ -1188,29 +1215,30 @@ def main():
                            font, font_scale, (255, 255, 255), thickness)
             
             # Draw warped view with square assignments for debugging
-            warped_display = warped.copy()
+            # Might remove later; board_viz is a general improvement over warped
+            # warped_display = warped.copy()
             
-            # Draw grid on warped view
-            for i in range(9):
-                # Vertical lines
-                x = i * SQUARE_SIZE
-                cv2.line(warped_display, (x, 0), (x, BOARD_SIZE), (0, 255, 255), 1)
-                # Horizontal lines  
-                y = i * SQUARE_SIZE
-                cv2.line(warped_display, (0, y), (BOARD_SIZE, y), (0, 255, 255), 1)
+            # # Draw grid on warped view
+            # for i in range(9):
+            #     # Vertical lines
+            #     x = i * SQUARE_SIZE
+            #     cv2.line(warped_display, (x, 0), (x, BOARD_SIZE), (0, 255, 255), 1)
+            #     # Horizontal lines  
+            #     y = i * SQUARE_SIZE
+            #     cv2.line(warped_display, (0, y), (BOARD_SIZE, y), (0, 255, 255), 1)
             
-            # Draw square labels at transformed positions
-            for square, det in square_map.items():
-                if "warped_center" in det:
-                    wx, wy = det["warped_center"]
-                    color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
-                    cv2.circle(warped_display, (int(wx), int(wy)), 5, color, -1)
-                    cv2.putText(warped_display, square, (int(wx) + 10, int(wy)),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # # Draw square labels at transformed positions
+            # for square, det in square_map.items():
+            #     if "warped_center" in det:
+            #         wx, wy = det["warped_center"]
+            #         color = (0, 255, 0) if 'white' in det['class'] else (255, 0, 0)
+            #         cv2.circle(warped_display, (int(wx), int(wy)), 5, color, -1)
+            #         cv2.putText(warped_display, square, (int(wx) + 10, int(wy)),
+            #                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            cv2.putText(warped_display, f"Pieces: {len(square_map)}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.imshow("Warped Board", warped_display)
+            # cv2.putText(warped_display, f"Pieces: {len(square_map)}", (10, 30),
+            #            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # cv2.imshow("Warped Board", warped_display)
             
             # Compare with target if provided
             if args.target_fen:
