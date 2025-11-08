@@ -245,8 +245,6 @@ def get_manual_corners(frame):
 
 # --------------------------------------------
 # HOMOGRAPHY / WARP
-# Implementation of schematic diagram output made this unnecessary
-# TODO: Consider removal.
 # --------------------------------------------
 def order_points(pts):
     """
