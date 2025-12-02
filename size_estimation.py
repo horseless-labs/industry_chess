@@ -189,18 +189,34 @@ def main():
         print("Calibration failed")
         return
     
+    # Trackbars for tuning detection
+    cv2.namedWindow('Controls')
+    cv2.createTrackbar('Canny Low', 'Controls', 50, 255, lambda x: None)
+    cv2.createTrackbar('Canny High', 'Controls', 100, 255, lambda x: None)
+    cv2.createTrackbar('Min Area', 'Controls', 500, 5000, lambda x: None)
+    cv2.createTrackbar('Show Debug', 'Controls', 0, 1, lambda x: None)
+    
     # Continuous video loop
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Failed to read frame")
             break
-            
+        
+        # Get trackbar values
+        canny_low = cv2.getTrackbarPos('Canny Low', 'Controls')
+        canny_high = cv2.getTrackbarPos('Canny High', 'Controls')
+        min_area = cv2.getTrackbarPos('Min Area', 'Controls')
+        show_debug = cv2.getTrackbarPos('Show Debug', 'Controls')
+        
         # Object detection
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        edges = cv2.Canny(blurred, 50, 100)
+        edges = cv2.Canny(blurred, canny_low, canny_high)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Debug info
+        detected_objects = 0
         
         # Draw reference points if available
         ref_points = calibration.get_reference_points(frame)
@@ -209,30 +225,45 @@ def main():
         
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 500:  # Filter small contours
+            if area < min_area:
                 continue
             
             try:
                 measurements = measurer.measure_contour(contour)
+                detected_objects += 1
                 
                 # Draw bounding box
                 cv2.drawContours(frame, [measurements['box']], 0, (0, 255, 0), 2)
                 
                 # Add text with measurements
                 text = f"{measurements['width_cm']:.1f} x {measurements['height_cm']:.1f} cm"
+                area_text = f"Area: {area:.0f}px"
                 text_pos = (int(measurements['center'][0] - 40), int(measurements['center'][1] - 10))
+                area_pos = (int(measurements['center'][0] - 40), int(measurements['center'][1] + 10))
+                
                 cv2.putText(frame, text, text_pos,
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(frame, area_text, area_pos,
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
                 
             except Exception as e:
-                # Skip problematic contours
+                print(f"Measurement error: {e}")
                 continue
         
-        # Display FPS or other info
-        cv2.putText(frame, "Press 'q' to quit, 'r' to recalibrate", (10, 30),
+        # Display info
+        info_text = f"Objects: {detected_objects} | Contours: {len(contours)} | PPM: {measurer.pixels_per_metric:.2f}"
+        cv2.putText(frame, info_text, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, "Press 'q' to quit, 'r' to recalibrate", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         cv2.imshow('Measurements', frame)
+        
+        # Show debug view
+        if show_debug:
+            cv2.imshow('Edges', edges)
+        else:
+            cv2.destroyWindow('Edges')
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -245,6 +276,6 @@ def main():
     
     cap.release()
     cv2.destroyAllWindows()
-
+    
 if __name__ == "__main__":
     main()
