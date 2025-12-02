@@ -282,7 +282,11 @@ def compute_homography(src_corners):
         [0, BOARD_SIZE]              # h1
     ], dtype=np.float32)
     
+    # TODO: investigate different homography methods.
+    # Default is the least squares method
+    # Options include RANSAC, LMEDS, and RHO
     H, _ = cv2.findHomography(src_corners, dst_corners)
+    # H, _ = cv2.findHomography(src_corners, dst_corners, cv2.RHO)
     return H
 
 

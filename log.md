@@ -153,3 +153,10 @@ Phone recording from a slightly higher angle had the same results with homograph
 
 ## 1920
 Rewrote the model to detect on original images instead of the homographically warped ones; the latter was overcounting the pieces and placing them in multiple squares. Current command for a nice demo output is `python3 chess_homography.py --source data/preliminary_videos/phone_video.mp4 --model runs/detect/train/weights/best.pt --use-bottom --nms 0.3 --conf 0.5`
+
+# 2025-12-02
+Next Steps:
+- The entire directory needs to be cleaned up.
+- We need to make moves to add size and/or angle estimation.
+- The bash file containing the commands also needs to be cleaned up.
+- In general, documentation needs to be improved.
