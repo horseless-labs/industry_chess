@@ -59,8 +59,13 @@ class HomographyCalibration(CalibrationStrategy):
         self.points = []
         self.H = None       # Homography matrix: original -> top-down
         self.H_inv = None   # Inverse homography: top-down -> original
+
         # In warped (top-down) space we define a fixed resolution:
         self.pixels_per_cm_warped = 10  # pixels per cm in the top-down metric image
+
+        # Store warped dimensions of the reference
+        self.warp_width_px = None
+        self.warp_height_px = None
         
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -113,6 +118,8 @@ class HomographyCalibration(CalibrationStrategy):
             # Destination points (ideal top-down view of the card)
             width_px = self.ref_width_cm * self.pixels_per_cm_warped
             height_px = self.ref_height_cm * self.pixels_per_cm_warped
+            self.warp_width_px = width_px
+            self.warp_height_px = height_px
             
             dst_pts = np.float32([
                 [0, 0],
@@ -125,8 +132,18 @@ class HomographyCalibration(CalibrationStrategy):
             self.H = cv2.getPerspectiveTransform(src_pts, dst_pts)
             self.H_inv = cv2.getPerspectiveTransform(dst_pts, src_pts)
             
-            print(f"Homography computed successfully!")
-            # Our "pixels per cm" in warped metric space is fixed by design:
+            print("Homography computed successfully!")
+
+            # Debug: measure the reference itself in warped space
+            card_cnt = src_pts.reshape(-1, 1, 2).astype(np.float32)
+            card_warped = cv2.perspectiveTransform(card_cnt, self.H)  # 4x1x2
+            rect = cv2.minAreaRect(card_warped.reshape(-1, 2))
+            w_px, h_px = rect[1]
+            w_cm_est = w_px / self.pixels_per_cm_warped
+            h_cm_est = h_px / self.pixels_per_cm_warped
+            print(f"[Debug] Reference in warped space ≈ {w_cm_est:.3f} x {h_cm_est:.3f} cm "
+                  f"(target {self.ref_width_cm:.3f} x {self.ref_height_cm:.3f} cm)")
+            
             return self.pixels_per_cm_warped
         
         return None
@@ -143,6 +160,83 @@ class HomographyCalibration(CalibrationStrategy):
         height_px = int(self.ref_height_cm * self.pixels_per_cm_warped)
         warped = cv2.warpPerspective(image, self.H, (width_px, height_px))
         return warped
+
+    def draw_grid(self, image, grid_step_cm=1.0, extent_factor=3.0):
+        """
+        Draw a perspective-correct metric grid on the ORIGINAL image.
+
+        grid_step_cm: spacing between grid lines in cm.
+        extent_factor: how far the grid extends relative to the card size.
+        """
+        if self.H is None or self.H_inv is None:
+            return image
+
+        ppc = self.pixels_per_cm_warped
+        if self.warp_width_px is None or self.warp_height_px is None:
+            warp_w = self.ref_width_cm * ppc
+            warp_h = self.ref_height_cm * ppc
+        else:
+            warp_w = self.warp_width_px
+            warp_h = self.warp_height_px
+
+        half_w = warp_w * extent_factor
+        half_h = warp_h * extent_factor
+
+        step_px = grid_step_cm * ppc
+        if step_px <= 0:
+            return image
+
+        img_out = image.copy()
+
+        # Vertical lines (constant x in warped space)
+        xs = np.arange(-half_w, half_w + step_px, step_px)
+        for x in xs:
+            p1 = np.array([[[x, -half_h]]], dtype=np.float32)  # (1,1,2)
+            p2 = np.array([[[x,  half_h]]], dtype=np.float32)
+            pts = np.concatenate([p1, p2], axis=0)             # (2,1,2)
+
+            pts_img = cv2.perspectiveTransform(pts, self.H_inv)  # (2,1,2) in original
+            pts_img = pts_img.reshape(-1, 2)
+            p1_img = tuple(np.intp(pts_img[0]))
+            p2_img = tuple(np.intp(pts_img[1]))
+
+            cv2.line(img_out, p1_img, p2_img, (80, 80, 80), 1, lineType=cv2.LINE_AA)
+
+        # Horizontal lines (constant y in warped space)
+        ys = np.arange(-half_h, half_h + step_px, step_px)
+        for y in ys:
+            p1 = np.array([[[-half_w, y]]], dtype=np.float32)
+            p2 = np.array([[[ half_w, y]]], dtype=np.float32)
+            pts = np.concatenate([p1, p2], axis=0)
+
+            pts_img = cv2.perspectiveTransform(pts, self.H_inv)
+            pts_img = pts_img.reshape(-1, 2)
+            p1_img = tuple(np.intp(pts_img[0]))
+            p2_img = tuple(np.intp(pts_img[1]))
+
+            cv2.line(img_out, p1_img, p2_img, (80, 80, 80), 1, lineType=cv2.LINE_AA)
+
+        # Optional: show a 10 cm indicator near the card
+        if len(self.points) == 4:
+            tl = np.array(self.points[0], dtype=np.float32)
+            tl_warp = np.array([[tl]], dtype=np.float32)  # 1x1x2
+            tl_metric = cv2.perspectiveTransform(tl_warp, self.H)  # to warped space
+
+            # A point 10 cm to the right in metric space
+            p2_metric = tl_metric.copy()
+            p2_metric[0, 0, 0] += 10 * ppc  # +10 cm in x
+
+            # Back to original
+            two_pts = np.concatenate([tl_metric, p2_metric], axis=0)  # 2x1x2
+            two_img = cv2.perspectiveTransform(two_pts, self.H_inv).reshape(-1, 2)
+            p1_img = tuple(np.intp(two_img[0]))
+            p2_img = tuple(np.intp(two_img[1]))
+
+            cv2.line(img_out, p1_img, p2_img, (0, 255, 255), 2, lineType=cv2.LINE_AA)
+            cv2.putText(img_out, "10cm", (p2_img[0] + 5, p2_img[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        return img_out
 
 
 class ObjectMeasurement:
@@ -163,12 +257,7 @@ class ObjectMeasurement:
         """
         Measure dimensions of a contour in real-world units.
 
-        Steps:
-        - contour is in ORIGINAL image coordinates.
-        - warp contour into top-down metric space using homography H.
-        - compute min-area rectangle in warped space.
-        - convert width/height from pixels -> cm using pixels_per_metric.
-        - project that rectangle's corners & center back to original for drawing.
+        contour: in ORIGINAL image coordinates (as from findContours).
         """
         if self.pixels_per_metric is None:
             raise ValueError("Must calibrate before measuring")
@@ -176,17 +265,21 @@ class ObjectMeasurement:
         if not hasattr(self.calibration, "H") or self.calibration.H is None:
             raise ValueError("Homography not available in calibration")
         
-        # Ensure float32 and correct shape (Nx1x2)
-        contour = contour.astype(np.float32)
+        # Ensure float32 and proper shape
+        contour = contour.astype(np.float32)  # (N, 1, 2)
         
         # Warp contour points into top-down metric space
-        contour_warped = cv2.perspectiveTransform(contour, self.calibration.H)  # Nx1x2
+        contour_warped = cv2.perspectiveTransform(contour, self.calibration.H)  # (N, 1, 2)
+        cnt_w = contour_warped.reshape(-1, 2)  # (N, 2)
         
+        if cnt_w.shape[0] < 3:
+            raise ValueError("Contour too small for measurement")
+
         # Get bounding box in warped space
-        rect = cv2.minAreaRect(contour_warped)
+        rect = cv2.minAreaRect(cnt_w)
         box_warped = cv2.boxPoints(rect)  # 4x2
         
-        # Dimensions in pixels (in warped metric space)
+        # Dimensions in pixels (warped metric space)
         width_px = rect[1][0]
         height_px = rect[1][1]
         
@@ -196,7 +289,7 @@ class ObjectMeasurement:
         
         # Project box corners back to ORIGINAL image space for drawing
         box_original = cv2.perspectiveTransform(
-            box_warped.reshape(-1, 1, 2),
+            box_warped.reshape(-1, 1, 2).astype(np.float32),
             self.calibration.H_inv
         )
         box_original = np.intp(box_original.reshape(-1, 2))
@@ -223,10 +316,9 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
-    # Use homography calibration with a letter-size paper (8.5" x 11" = 21.6 x 27.9 cm)
-    # Or use A4 paper: 21.0 x 29.7 cm
+    # Use homography calibration with a credit card (approx 8.56 x 5.398 cm)
     print("\n=== Camera Calibration ===")
-    print("Place a rectangular reference object (e.g., letter paper) flat on the surface.")
+    print("Place a credit card (or card-sized rectangle) flat on the surface.")
     print("Make sure all 4 corners are clearly visible.\n")
     
     calibration = HomographyCalibration(ref_width_cm=8.56, ref_height_cm=5.398)
@@ -250,11 +342,12 @@ def main():
     cv2.namedWindow('Controls')
     cv2.resizeWindow('Measurements', 1280, 720)
     
-    # Trackbars for tuning detection
+    # Trackbars for tuning detection & grid
     cv2.createTrackbar('Canny Low', 'Controls', 50, 255, lambda x: None)
     cv2.createTrackbar('Canny High', 'Controls', 150, 255, lambda x: None)
-    cv2.createTrackbar('Min Area', 'Controls', 500, 10000, lambda x: None)
+    cv2.createTrackbar('Min Area', 'Controls', 500, 100000, lambda x: None)
     cv2.createTrackbar('Show Edges', 'Controls', 0, 1, lambda x: None)
+    cv2.createTrackbar('Grid Step cm', 'Controls', 2, 20, lambda x: None)
     
     while True:
         ret, frame = cap.read()
@@ -269,6 +362,9 @@ def main():
         canny_high = cv2.getTrackbarPos('Canny High', 'Controls')
         min_area = cv2.getTrackbarPos('Min Area', 'Controls')
         show_edges = cv2.getTrackbarPos('Show Edges', 'Controls')
+        grid_step_cm = cv2.getTrackbarPos('Grid Step cm', 'Controls')
+        if grid_step_cm <= 0:
+            grid_step_cm = 1
         
         # Build a mask to exclude the reference card region in ORIGINAL image
         mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
@@ -292,7 +388,6 @@ def main():
                 continue
             
             try:
-                # Measure by warping contour into metric space (homography) internally
                 measurements = measurer.measure_contour(contour)
                 detected += 1
                 
@@ -315,10 +410,15 @@ def main():
                 cv2.putText(frame_display, text, text_pos,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
-            except Exception as e:
-                # If something explodes for a weird contour, skip it
-                # print("Measurement error:", e)
+            except Exception:
                 continue
+        
+        # Draw metric grid on top of the original frame
+        frame_display = calibration.draw_grid(
+            frame_display,
+            grid_step_cm=float(grid_step_cm),
+            extent_factor=4.0
+        )
         
         # Display reference points on original view
         ref_points = calibration.get_reference_points(frame)
@@ -333,7 +433,7 @@ def main():
                 cv2.line(frame_display, ref_points[i], ref_points[(i+1) % 4], (255, 0, 0), 2)
         
         # Info overlay
-        cv2.rectangle(frame_display, (5, 5), (400, 90), (0, 0, 0), -1)
+        cv2.rectangle(frame_display, (5, 5), (430, 100), (0, 0, 0), -1)
         info1 = f"Objects Detected: {detected}"
         info2 = f"Total Contours: {len(contours)}"
         info3 = "q=quit | r=recalibrate"
