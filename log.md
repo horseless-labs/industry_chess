@@ -160,3 +160,4 @@ Next Steps:
 - We need to make moves to add size and/or angle estimation.
 - The bash file containing the commands also needs to be cleaned up.
 - In general, documentation needs to be improved.
+- Retrain with YOLOv9 (for licensing purposes)
