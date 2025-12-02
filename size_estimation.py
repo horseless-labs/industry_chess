@@ -340,7 +340,9 @@ def main():
     # Create windows
     cv2.namedWindow('Measurements', cv2.WINDOW_NORMAL)
     cv2.namedWindow('Controls')
+    cv2.namedWindow('Contours', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Measurements', 1280, 720)
+    cv2.resizeWindow('Contours', 640, 480)
     
     # Trackbars for tuning detection & grid
     cv2.createTrackbar('Canny Low', 'Controls', 50, 255, lambda x: None)
@@ -381,12 +383,20 @@ def main():
         edges = cv2.bitwise_and(edges, edges, mask=mask)  # Apply mask to edges too
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        # Build contour-only debug view
+        contour_display = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        
         detected = 0
         for contour in contours:
             area = cv2.contourArea(contour)
             if area < min_area:
+                # Draw small contours in red in the contour window
+                cv2.drawContours(contour_display, [contour], -1, (0, 0, 255), 1)
                 continue
             
+            # Draw accepted contours in green in the contour window
+            cv2.drawContours(contour_display, [contour], -1, (0, 255, 0), 2)
+
             try:
                 measurements = measurer.measure_contour(contour)
                 detected += 1
@@ -445,9 +455,13 @@ def main():
         cv2.putText(frame_display, info3, (10, 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
+        # Show main measurement view
         cv2.imshow('Measurements', frame_display)
+
+        # Show contour-only debug view
+        cv2.imshow('Contours', contour_display)
         
-        # Show edge detection debug view
+        # Show edge detection debug view (optional raw edges)
         if show_edges:
             cv2.namedWindow('Edge Detection', cv2.WINDOW_NORMAL)
             cv2.resizeWindow('Edge Detection', 640, 480)
