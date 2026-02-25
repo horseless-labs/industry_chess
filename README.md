@@ -68,16 +68,12 @@ All outputs are structured and machine-readable.
 * NumPy
 * python-chess
 
----
-
 ## Current Status
 
 * Real-time board detection is spotty; proceeded through demo with manual corner selection
 * Piece detection functional
 * FEN generation stable
 * Basic event logging active; an accurate board and score can be generated, but database or analysis logic is yet to be implemented
-
----
 
 ## Roadmap
 
@@ -87,8 +83,6 @@ All outputs are structured and machine-readable.
 * Fix corner detection
 * Integrate hardware manipulation (gantry / robotic arm)
 * Implement closed-loop validation
-
----
 
 ## Design Principle
 
