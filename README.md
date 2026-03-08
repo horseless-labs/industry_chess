@@ -1,93 +1,148 @@
 # Industry Chess
 
-Industry Chess is a computer vision testbed for real-time process validation in a controlled physical environment. It uses a chessboard as a structured sandbox to demonstrate how visual input can be converted into validated state transitions and structured process data.
+**Computer Vision Testbed for Real-Time Process Validation**
 
-Chess is not the objective, just the is the constrained environment used to prototype validation systems. This project explores how computer vision can be used to:
+Industry Chess is a computer vision system designed to explore **visual validation of physical process state**. The project uses a chessboard as a controlled physical environment to prototype techniques for converting visual input into structured, machine-readable state transitions.
 
-* Validate whether a task was completed correctly
-* Detect missing, misplaced, or incorrect components
-* Track process state transitions automatically
-* Measure cycle time per operation
-* Generate structured data for downstream analytics
+The objective is not to play chess. The chessboard simply provides a deterministic, rule-constrained system that makes it possible to develop and test validation logic before applying the same techniques to real industrial workflows.
 
-The chessboard provides a deterministic, rule-constrained system that allows reliable validation logic to be developed before deployment in industrial settings.
+The system demonstrates how computer vision can be used to:
 
-## Overview
+- Infer structured state directly from observed physical configuration
+- Detect missing, misplaced, or incorrect components
+- Validate state transitions between steps
+- Record timestamped events for process analytics
+- Measure cycle time between operations
 
-The system observes a physical chessboard through a camera feed and performs:
+Industry Chess serves as a sandbox for developing methods that could later be applied to assembly validation, inspection systems, or automated quality control.
 
-* Board detection and geometric normalization
-* Piece detection and classification
-* Coordinate mapping
-* Structured state generation (FEN)
-* State comparison and move inference
-* Timestamped event logging
+![Board Detection](data/detection.png)
+![Board Visualization](data/visualization.png)
 
-The result is a continuously updated, machine-readable representation of physical state.
+# Overview
 
-## System Pipeline
+Industry Chess observes a physical chessboard using a camera and continuously converts the board state into a structured digital representation.
 
-Camera Input
-→ Board Detection (Homography)
-→ Piece Detection (YOLO)
-→ Square Mapping
-→ FEN State Generation
-→ State Comparison
-→ Move Validation
-→ Event Logging
+Each frame from the camera feed passes through a pipeline that performs:
 
-Each frame is converted into structured state. Each state transition is validated and recorded.
+- Board detection and geometric normalization
+- Piece detection and classification
+- Square coordinate mapping
+- Board state generation using **FEN (Forsyth–Edwards Notation)**
+- State comparison between frames
+- Move inference and validation
+- Timestamped event logging
 
-## Industrial Analogy
+The result is a continuously updated, machine-readable description of the physical system.
 
-In a manufacturing context, the same architecture can be applied to:
+# System Architecture
 
-* Assembly verification
-* Fixture state monitoring
-* Step-by-step procedural enforcement
-* Quality-control validation
-* Cycle-time analysis
+The system converts raw visual input into structured state through a layered pipeline.
 
-Instead of relying on manual logging or operator confirmation, state is inferred directly from observed physical configuration.
+Camera Feed → Board Detection → Homography Normalization → Piece Detection (YOLO) → Square Mapping → FEN Generation → State Comparison → Move Validation → Event Logging
 
-## Example Outputs
+Each stage has a specific responsibility:
 
-* FEN string representing full board state
-* Detected move (e.g., e2 → e4)
-* Timestamped state transitions
-* Piece count validation
-* Cycle-time measurement between moves
+| Layer            | Role                                    |
+| ---------------- | --------------------------------------- |
+| Camera Input     | Provides real-time visual data          |
+| Board Detection  | Identifies chessboard corners           |
+| Homography       | Normalizes board perspective            |
+| Piece Detection  | Detects and classifies pieces           |
+| Square Mapping   | Assigns detections to board coordinates |
+| FEN Generation   | Creates structured board state          |
+| State Comparison | Detects state transitions               |
+| Move Validation  | Infers and validates moves              |
+| Event Logging    | Records structured process events       |
 
-All outputs are structured and machine-readable.
+This architecture mirrors how computer vision systems in industrial environments convert physical observations into actionable data.
 
-## Tech Stack
+# Industrial Analogy
+
+The same system architecture can be applied to manufacturing or robotics workflows.
+
+For example:
+
+| Chess System    | Industrial Equivalent |
+| --------------- | --------------------- |
+| Chess pieces    | Physical components   |
+| Board squares   | Assembly locations    |
+| Moves           | Process steps         |
+| FEN state       | Assembly state        |
+| Move validation | Process validation    |
+
+In an industrial setting, a similar pipeline could be used for:
+
+- Assembly verification
+- Fixture state monitoring
+- Step-by-step procedural validation
+- Quality-control inspection
+- Cycle-time measurement
+
+Instead of relying on operator input or manual logging, process state is inferred directly from visual observation.
+
+# Example Outputs
+
+The system generates structured outputs that can be consumed by downstream systems.
+
+Examples include:
+
+- FEN string representing complete board state
+- Detected move (example: `e2 → e4`)
+- Timestamped state transitions
+- Piece count validation
+- Cycle-time measurement between moves
+
+These outputs are designed to be machine-readable and suitable for storage, analytics, or process monitoring.
+
+# Tech Stack
 
 * Python
 * OpenCV
-* YOLO
+* YOLOv8
 * NumPy
 * python-chess
 
-## Current Status
+# Current Status
 
-* Real-time board detection is spotty; proceeded through demo with manual corner selection
-* Piece detection functional
-* FEN generation stable
-* Basic event logging active; an accurate board and score can be generated, but database or analysis logic is yet to be implemented
+The system currently demonstrates the full state-extraction pipeline, with some limitations in robustness.
 
-## Roadmap
+Implemented:
 
-* Improve detection robustness under lighting variation
-* Add anomaly detection layer
-* Expand structured logging and export formats
-* Fix corner detection
-* Integrate hardware manipulation (gantry / robotic arm)
-* Implement closed-loop validation
+- Piece detection and classification
+- Square mapping
+- Stable FEN state generation
+- Basic event logging
+- Move inference from state transitions
 
-## Design Principle
+Known limitations:
 
-Physical state → Structured representation → Validation → Logged event
+- Automatic board detection is inconsistent under some lighting conditions
+- Manual corner selection used during demonstration
+- Structured database storage not yet implemented
+- Analytics layer not yet developed
 
-The core problem being solved is reliable extraction of enforceable state from visual input.
+Despite these limitations, the system can generate an accurate board state and move log in real time.
 
-Industry Chess exists to test and refine that capability.
+# Roadmap
+
+Future development will focus on improving robustness and extending the system toward a full process-validation framework.
+
+Planned improvements:
+
+- Improve board detection reliability
+- Add anomaly detection for illegal states
+- Expand structured event logging
+- Integrate persistent storage for analytics
+- Explore hardware manipulation (gantry or robotic arm)
+- Implement closed-loop validation systems
+
+# Design Principle
+
+Industry Chess explores a simple but powerful architectural idea:
+
+Physical State → Structured Representation → Validation → Logged Event
+
+Reliable extraction of enforceable state from visual input is a central problem in computer vision applications for manufacturing and robotics.
+
+Industry Chess exists to prototype and refine that capability.
